@@ -1,26 +1,20 @@
 from collections.abc import Callable
-from dataclasses import dataclass
 from typing import Protocol
 
-from memkernel.backend.backend import MemoryRecord, ScoredMemory
+from memkernel.backend.backend import ScoredMemory
+from memkernel.retriver import RecallResults, RetrievalResult
 
 
-class SemanticSearchBackend(Protocol):
+class SearchBackend(Protocol):
     def search_current(self, content: str, top_k: int = 5) -> list[ScoredMemory]: ...
 
     def search_history(self, content: str, top_k: int = 5) -> list[ScoredMemory]: ...
 
 
-@dataclass(frozen=True, slots=True)
-class RetrievalResult:
-    memory: MemoryRecord
-    score: float
-
-
 class SemanticRetriever:
     """A very simple retrive"""
 
-    def __init__(self, memory_backend: SemanticSearchBackend):
+    def __init__(self, memory_backend: SearchBackend):
         self.memory_backend = memory_backend
 
     def retrieve(
@@ -29,8 +23,40 @@ class SemanticRetriever:
         top_k: int = 5,
         threshold: float = 0.5,
     ) -> list[RetrievalResult]:
-        """Retrieve current memories. Kept as the default retrieval API."""
+        """Retrieve current memories using the legacy convenience API."""
         return self.retrieve_current(query, top_k=top_k, threshold=threshold)
+
+    def recall(
+        self,
+        query: str,
+        *,
+        current_top_k: int = 5,
+        history_top_k: int = 0,
+        threshold: float = 0.5,
+    ) -> RecallResults:
+        """Retrieve current and historical memories with independent limits."""
+        if (
+            isinstance(history_top_k, bool)
+            or not isinstance(history_top_k, int)
+            or history_top_k < 0
+        ):
+            raise ValueError("history_top_k must be a non-negative integer")
+
+        current = self.retrieve_current(
+            query,
+            top_k=current_top_k,
+            threshold=threshold,
+        )
+        history = (
+            self.retrieve_history(
+                query,
+                top_k=history_top_k,
+                threshold=threshold,
+            )
+            if history_top_k > 0
+            else []
+        )
+        return RecallResults(current=current, history=history)
 
     def retrieve_current(
         self,
@@ -72,8 +98,8 @@ class SemanticRetriever:
             raise ValueError("top_k must be a positive integer")
         if isinstance(threshold, bool) or not isinstance(threshold, (int, float)):
             raise ValueError("threshold must be a number")
-        if not -1.0 <= threshold <= 1.0:
-            raise ValueError("threshold must be between -1 and 1")
+        if not 0.0 <= threshold <= 1.0:
+            raise ValueError("threshold must be between 0 and 1")
 
         matches = search(
             query.strip(),
