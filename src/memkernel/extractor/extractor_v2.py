@@ -1,55 +1,115 @@
+from __future__ import annotations
+
 import json
-from typing import Any, Dict
 from dataclasses import dataclass
+from datetime import datetime, timezone
+from typing import Any
 
 from memkernel.ai import AIProvider, DeepSeekAI
-from memkernel.utility.time_helper import now
-from .extractor import ExtractedResult
+from memkernel.provenance import SourceEvent
 
 
-# replace time with real time.
-# TODO: add last 20 messages to prompt to help performance?
-EXTRACTOR_PROMPT = f"""
-You are MemKernel's memory extractor. Convert the input message into a small
-set of durable facts that may be useful in future conversations.
+EXTRACTOR_PROMPT = """
+You are MemKernel's evidence-bound memory extractor. Convert the supplied
+source event into a small set of durable facts that may be useful later.
 
-Extract only information explicitly supported by the input, including:
+Extract only information explicitly supported by source.content, including:
 - stable preferences, dislikes, and personal details;
 - relationships, roles, skills, and ongoing work;
 - plans, goals, commitments, and decisions;
 - meaningful events, experiences, constraints, and corrections.
 
 Rules:
-1. Write one atomic, self-contained fact per list item.
-2. Resolve pronouns only when the referenced person or object is unambiguous.
-3. Preserve important qualifiers, negations, and time expressions.
-4. Do not invent details, explanations, implications, or personality traits.
-5. Ignore greetings, small talk, generic knowledge, and temporary requests
-   that will not be useful later.
-6. Do not store passwords, API keys, authentication tokens, or other secrets.
-7. Remove duplicate or semantically equivalent facts.
-8. Write facts in the same language as the input.
-9. You should replace some ambiguous time to real time of it. Today is {now()}.
+1. Write one atomic, self-contained fact per item.
+2. For every fact, copy a non-empty evidence quote exactly as it appears in
+   source.content. Never paraphrase the evidence quote.
+3. Resolve pronouns only when the referenced person or object is unambiguous.
+4. Preserve qualifiers, negations, quantities, and time expressions.
+5. Resolve relative time using source.observed_at, not the current clock.
+6. Do not invent details, implications, explanations, or personality traits.
+7. Ignore greetings, generic knowledge, and temporary requests that will not
+   be useful later.
+8. Do not extract passwords, keys, authentication tokens, or redacted values.
+9. Remove duplicate or semantically equivalent facts.
+10. Write facts in the same language as source.content.
 
 Return valid JSON only, using exactly this schema:
-    {{"facts": ["first fact", "second fact"]}}
+{"facts": [{"content": "one durable fact", "evidence": "exact quote"}]}
 
-If the input contains nothing worth remembering, return:
-    {{"facts": []}}
-
-Examples:
-Input: Hi, how are you?
-Output: {{"facts": []}}
-
-Input: I like Rust and I am building a small memory system.
-Output: {{"facts": ["User likes Rust.", "User is building a small memory system."]}}
+If the source contains nothing worth remembering, return:
+{"facts": []}
 """.strip()
 
 
-@dataclass(slots=True, frozen=True)
+class ExtractionValidationError(ValueError):
+    """The extractor returned output that cannot be safely persisted."""
+
+
+@dataclass(frozen=True, slots=True)
+class ExtractedFact:
+    content: str
+    evidence: str
+
+
+@dataclass(frozen=True, slots=True)
 class JsonExtractedResult:
     content: str
-    parsed_dict: Dict[Any, Any]
+    parsed_dict: dict[str, Any]
+    facts: tuple[ExtractedFact, ...] = ()
+
+
+def parse_extracted_facts(
+    payload: object,
+    *,
+    source_content: str,
+) -> tuple[ExtractedFact, ...]:
+    """we will make sure the final json's evidence from source content"""
+    if not isinstance(payload, dict) or set(payload) != {"facts"}:
+        raise ExtractionValidationError(
+            'Extractor response must be an object containing only "facts"'
+        )
+
+    raw_facts = payload["facts"]
+    #
+    if not isinstance(raw_facts, list):
+        raise ExtractionValidationError('Extractor response "facts" must be a list')
+
+    facts: list[ExtractedFact] = []
+    for raw_fact in raw_facts:
+        # check if key is right. and it is a dict
+        if not isinstance(raw_fact, dict) or set(raw_fact) != {
+            "content",
+            "evidence",
+        }:
+            raise ExtractionValidationError(
+                "Each extracted fact must contain only content and evidence"
+            )
+
+        content = raw_fact["content"]
+        evidence = raw_fact["evidence"]
+
+        if not isinstance(content, str) or not content.strip():
+            raise ExtractionValidationError(
+                "Extracted fact content must be a non-empty string"
+            )
+        if not isinstance(evidence, str) or not evidence.strip():
+            raise ExtractionValidationError(
+                "Extracted fact evidence must be a non-empty string"
+            )
+        # make sure evidence come from source
+        if evidence not in source_content:
+            raise ExtractionValidationError(
+                "Extracted evidence must be an exact source-content substring"
+            )
+
+        facts.append(
+            ExtractedFact(
+                content=content.strip(),
+                evidence=evidence,
+            )
+        )
+
+    return tuple(facts)
 
 
 class LLMExtractorV2:
@@ -58,12 +118,46 @@ class LLMExtractorV2:
         self.llm_prompt = EXTRACTOR_PROMPT
         self.client = self.llm.get_client()
 
-    def extract(self, given_info: str) -> ExtractedResult:
-        result = self.llm.get_ai_response(
-            self.client, inst=self.llm_prompt, input_text=given_info
+    # TODO: more role. and add recent info as context
+    def extract(self, given_info: str) -> JsonExtractedResult:
+        """Extract from a plain user message using current UTC as event time."""
+        source = SourceEvent(
+            id="",
+            content=given_info,
+            source_type="message",
+            role="user",
+            observed_at=datetime.now(timezone.utc).isoformat(),
         )
-        parsed_dict = json.loads(result)
+        return self.extract_with_source(source)
+
+    def extract_with_source(self, source: SourceEvent) -> JsonExtractedResult:
+        input_payload = {
+            "source": {
+                "content": source.content,
+                "source_type": source.source_type,
+                "role": source.role,
+                "observed_at": source.observed_at,
+            }
+        }
+        result = self.llm.get_ai_response(
+            self.client,
+            inst=self.llm_prompt,
+            input_text=json.dumps(input_payload, ensure_ascii=False),
+        )
+        try:
+            parsed = json.loads(result)
+        except (json.JSONDecodeError, TypeError) as error:
+            raise ExtractionValidationError(
+                "Extractor response must be valid JSON"
+            ) from error
+
+        # This function will make sure evidence from source
+        facts = parse_extracted_facts(
+            parsed,
+            source_content=source.content,
+        )
         return JsonExtractedResult(
-            result,
-            parsed_dict,
+            content=result,
+            parsed_dict=parsed,
+            facts=facts,
         )
