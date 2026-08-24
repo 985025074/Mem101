@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import Protocol
 
 from memkernel.ai import AIProvider, DeepSeekAI
+from memkernel.provenance import SourceEvent
 
 
 class ExtractedResult(Protocol):
@@ -17,7 +18,7 @@ class SimpleExtractedResult:
 
 
 class Extractor(Protocol):
-    def extract(self, given_info: str) -> ExtractedResult: ...
+    def extract_with_source(self, source: SourceEvent) -> ExtractedResult: ...
 
 
 # Prototype
