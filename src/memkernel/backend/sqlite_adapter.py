@@ -3,17 +3,26 @@ import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, cast
 
 import sqlite_vec
 
-from memkernel.backend.backend import MemoryRecord, ScoredMemory
+from memkernel.backend.backend import MemoryRecord, MemoryState, ScoredMemory
 from memkernel.embedding import EmbeddingProvider
 from memkernel.extractor import ExtractedResult
 
 
 class SQLiteBackend:
-    _QUERYABLE_COLUMNS = frozenset({"id", "content", "created_at"})
+    _QUERYABLE_COLUMNS = frozenset(
+        {
+            "id",
+            "content",
+            "created_at",
+            "state",
+            "superseded_by_id",
+            "superseded_at",
+        }
+    )
 
     def __init__(
         self,
@@ -57,11 +66,25 @@ class SQLiteBackend:
                 CREATE TABLE IF NOT EXISTS memories (
                     id TEXT PRIMARY KEY,
                     content TEXT NOT NULL,
-                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    state TEXT NOT NULL DEFAULT 'ACTIVE'
+                        CHECK (state IN ('ACTIVE', 'SUPERSEDED')),
+                    superseded_by_id TEXT,
+                    superseded_at TEXT,
+                    FOREIGN KEY (superseded_by_id) REFERENCES memories(id)
+                        ON DELETE SET NULL
                 )
                 """
             )
-            # memory seamantic embedding queried by memory id
+            # add state and  others
+            self._migrate_memory_state(connection)
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_memories_state
+                ON memories(state)
+                """
+            )
+            # add table of memory seamantic embedding queried by memory id
             connection.execute(
                 """
                 CREATE TABLE IF NOT EXISTS memory_embeddings (
@@ -74,6 +97,55 @@ class SQLiteBackend:
                 """
             )
 
+    @staticmethod
+    def _migrate_memory_state(connection: sqlite3.Connection) -> None:
+        """Add lifecycle columns to databases created before memory states."""
+        columns = {
+            row["name"]
+            for row in connection.execute("PRAGMA table_info(memories)").fetchall()
+        }
+        if "state" not in columns:
+            connection.execute(
+                """
+                ALTER TABLE memories
+                ADD COLUMN state TEXT NOT NULL DEFAULT 'ACTIVE'
+                    CHECK (state IN ('ACTIVE', 'SUPERSEDED'))
+                """
+            )
+        if "superseded_by_id" not in columns:
+            connection.execute(
+                """
+                ALTER TABLE memories
+                ADD COLUMN superseded_by_id TEXT
+                    REFERENCES memories(id) ON DELETE SET NULL
+                """
+            )
+        if "superseded_at" not in columns:
+            connection.execute(
+                """
+                ALTER TABLE memories
+                ADD COLUMN superseded_at TEXT
+                """
+            )
+
+    @staticmethod
+    def _memory_from_row(row: sqlite3.Row) -> MemoryRecord:
+        """Change a sqlite row to our memory record"""
+        return MemoryRecord(
+            id=row["id"],
+            content=row["content"],
+            created_at=row["created_at"],
+            state=cast(MemoryState, row["state"]),
+            superseded_by_id=row["superseded_by_id"],
+            superseded_at=row["superseded_at"],
+        )
+
+    @staticmethod
+    def _validate_content(content: str) -> str:
+        if not isinstance(content, str) or not content.strip():
+            raise ValueError("content must be a non-empty string")
+        return content.strip()
+
     def _create_embedding(self, content: str) -> list[float]:
         """Get embedding of a string"""
         if self.embedding_provider is None:
@@ -84,6 +156,7 @@ class SQLiteBackend:
         return embedding
 
     def insert(self, content: str) -> str:
+        content = self._validate_content(content)
         memory_id = str(uuid.uuid4())
         embedding = None
         if self.embedding_provider is not None:
@@ -115,6 +188,66 @@ class SQLiteBackend:
 
         return memory_id
 
+    def supersede(self, memory_id: str, content: str) -> str:
+        """Atomically replace an active memory while preserving its history."""
+        if not isinstance(memory_id, str) or not memory_id.strip():
+            raise ValueError("memory_id must be a non-empty string")
+        content = self._validate_content(content)
+
+        new_memory_id = str(uuid.uuid4())
+        embedding = None
+        if self.embedding_provider is not None:
+            embedding = self._create_embedding(content)
+
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            existing = connection.execute(
+                "SELECT state FROM memories WHERE id = ?",
+                (memory_id,),
+            ).fetchone()
+            if existing is None:
+                raise ValueError(f"Memory with id {memory_id} was not found")
+            if existing["state"] != "ACTIVE":
+                raise ValueError("Only an active memory can be superseded")
+
+            connection.execute(
+                """
+                INSERT INTO memories (id, content)
+                VALUES (?, ?)
+                """,
+                (new_memory_id, content),
+            )
+            if embedding is not None:
+                connection.execute(
+                    """
+                    INSERT INTO memory_embeddings (
+                        memory_id, dimensions, embedding
+                    )
+                    VALUES (?, ?, ?)
+                    """,
+                    (
+                        new_memory_id,
+                        len(embedding),
+                        sqlite_vec.serialize_float32(embedding),
+                    ),
+                )
+
+            # insertion finished.Then lets make the old one outdated
+            cursor = connection.execute(
+                """
+                UPDATE memories
+                SET state = 'SUPERSEDED',
+                    superseded_by_id = ?,
+                    superseded_at = CURRENT_TIMESTAMP
+                WHERE id = ? AND state = 'ACTIVE'
+                """,
+                (new_memory_id, memory_id),
+            )
+            if cursor.rowcount != 1:
+                raise RuntimeError("Memory state changed while it was being superseded")
+
+        return new_memory_id
+
     def remember(self, extracted: ExtractedResult) -> str:
         return self.insert(extracted.content)
 
@@ -122,7 +255,13 @@ class SQLiteBackend:
         with self._connect() as connection:
             row = connection.execute(
                 """
-                SELECT id, content, created_at
+                SELECT
+                    id,
+                    content,
+                    created_at,
+                    state,
+                    superseded_by_id,
+                    superseded_at
                 FROM memories
                 WHERE id = ?
                 """,
@@ -132,11 +271,7 @@ class SQLiteBackend:
         if row is None:
             return None
 
-        return MemoryRecord(
-            id=row["id"],
-            content=row["content"],
-            created_at=row["created_at"],
-        )
+        return self._memory_from_row(row)
 
     def remove(self, memory_id: str) -> bool:
         """Remove a memory and its embedding, returning whether it existed."""
@@ -178,7 +313,13 @@ class SQLiteBackend:
         with self._connect() as connection:
             row = connection.execute(
                 f"""
-                SELECT id, content, created_at
+                SELECT
+                    id,
+                    content,
+                    created_at,
+                    state,
+                    superseded_by_id,
+                    superseded_at
                 FROM memories
                 WHERE {where_clause}
                 ORDER BY created_at DESC, rowid DESC
@@ -190,15 +331,26 @@ class SQLiteBackend:
         if row is None:
             return None
 
-        return MemoryRecord(
-            id=row["id"],
-            content=row["content"],
-            created_at=row["created_at"],
-        )
+        return self._memory_from_row(row)
 
     def search_similar(self, content: str, top_k: int = 5) -> list[ScoredMemory]:
-        if not content.strip():
-            raise ValueError("content must not be empty")
+        """Search current memories. Kept as a backward-compatible alias."""
+        return self.search_current(content, top_k=top_k)
+
+    def search_current(self, content: str, top_k: int = 5) -> list[ScoredMemory]:
+        return self._search_by_state(content, top_k=top_k, state="ACTIVE")
+
+    def search_history(self, content: str, top_k: int = 5) -> list[ScoredMemory]:
+        return self._search_by_state(content, top_k=top_k, state="SUPERSEDED")
+
+    def _search_by_state(
+        self,
+        content: str,
+        *,
+        top_k: int,
+        state: MemoryState,
+    ) -> list[ScoredMemory]:
+        content = self._validate_content(content)
         if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0:
             raise ValueError("top_k must be a positive integer")
 
@@ -212,23 +364,22 @@ class SQLiteBackend:
                     m.id,
                     m.content,
                     m.created_at,
+                    m.state,
+                    m.superseded_by_id,
+                    m.superseded_at,
                     vec_distance_cosine(e.embedding, ?) AS distance
                 FROM memory_embeddings AS e
                 JOIN memories AS m ON m.id = e.memory_id
-                WHERE e.dimensions = ?
+                WHERE e.dimensions = ? AND m.state = ?
                 ORDER BY distance ASC
                 LIMIT ?
                 """,
-                (serialized_query, len(query_embedding), top_k),
+                (serialized_query, len(query_embedding), state, top_k),
             ).fetchall()
 
         return [
             ScoredMemory(
-                memory=MemoryRecord(
-                    id=row["id"],
-                    content=row["content"],
-                    created_at=row["created_at"],
-                ),
+                memory=self._memory_from_row(row),
                 similarity=max(-1.0, min(1.0, 1.0 - float(row["distance"]))),
             )
             for row in rows
@@ -264,17 +415,16 @@ class SQLiteBackend:
         with self._connect() as connection:
             rows = connection.execute(
                 """
-                SELECT id, content, created_at
+                SELECT
+                    id,
+                    content,
+                    created_at,
+                    state,
+                    superseded_by_id,
+                    superseded_at
                 FROM memories
                 ORDER BY created_at DESC
                 """
             ).fetchall()
 
-        return [
-            MemoryRecord(
-                id=row["id"],
-                content=row["content"],
-                created_at=row["created_at"],
-            )
-            for row in rows
-        ]
+        return [self._memory_from_row(row) for row in rows]

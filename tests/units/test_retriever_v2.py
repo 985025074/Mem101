@@ -14,15 +14,26 @@ def memory(memory_id: str, content: str) -> MemoryRecord:
 
 
 class FakeSemanticBackend:
-    def __init__(self, matches: list[ScoredMemory]):
+    def __init__(
+        self,
+        matches: list[ScoredMemory],
+        historical_matches: list[ScoredMemory] | None = None,
+    ):
         self.matches = matches
-        self.calls: list[tuple[str, int]] = []
+        self.historical_matches = historical_matches or []
+        self.calls: list[tuple[str, str, int]] = []
 
-    def search_similar(
+    def search_current(
         self, content: str, top_k: int = 5
     ) -> list[ScoredMemory]:
-        self.calls.append((content, top_k))
+        self.calls.append(("current", content, top_k))
         return self.matches
+
+    def search_history(
+        self, content: str, top_k: int = 5
+    ) -> list[ScoredMemory]:
+        self.calls.append(("history", content, top_k))
+        return self.historical_matches
 
 
 class StaticEmbeddingProvider:
@@ -56,7 +67,7 @@ def test_retrieve_filters_and_ranks_semantic_matches() -> None:
         RetrievalResult(memory("best", "Best match"), 0.95),
         RetrievalResult(memory("medium", "Medium match"), 0.72),
     ]
-    assert backend.calls == [("Rust preference", 3)]
+    assert backend.calls == [("current", "Rust preference", 3)]
 
 
 def test_retrieve_enforces_top_k_even_if_backend_returns_more() -> None:
@@ -88,6 +99,30 @@ def test_retrieve_returns_empty_list_when_nothing_matches() -> None:
     assert retriever.retrieve("query") == []
 
 
+def test_current_and_history_use_independent_top_k_values() -> None:
+    backend = FakeSemanticBackend(
+        [
+            ScoredMemory(memory("current-1", "Current one"), 0.9),
+            ScoredMemory(memory("current-2", "Current two"), 0.8),
+        ],
+        historical_matches=[
+            ScoredMemory(memory("history-1", "History one"), 0.95),
+            ScoredMemory(memory("history-2", "History two"), 0.85),
+        ],
+    )
+    retriever = SemanticRetriever(backend)
+
+    current = retriever.retrieve_current("preference", top_k=1)
+    history = retriever.retrieve_history("preference", top_k=2)
+
+    assert [result.memory.id for result in current] == ["current-1"]
+    assert [result.memory.id for result in history] == ["history-1", "history-2"]
+    assert backend.calls == [
+        ("current", "preference", 1),
+        ("history", "preference", 2),
+    ]
+
+
 def test_retrieve_integrates_with_backend_v2_without_calling_llm(tmp_path) -> None:
     backend = BackendV2(
         tmp_path / "memory.db",
@@ -102,6 +137,23 @@ def test_retrieve_integrates_with_backend_v2_without_calling_llm(tmp_path) -> No
     )
 
     assert [result.memory.id for result in results] == [memory_id]
+
+
+def test_history_retrieval_integrates_with_backend_v2(tmp_path) -> None:
+    backend = BackendV2(
+        tmp_path / "memory.db",
+        ai_provider=UnusedAI(),
+        embedding_provider=StaticEmbeddingProvider(),
+    )
+    old_id = backend.sqlite_backend.insert("User lived in Shanghai.")
+    new_id = backend.sqlite_backend.supersede(old_id, "User lives in Beijing.")
+    retriever = SemanticRetriever(backend)
+
+    current = retriever.retrieve_current("where user lives", threshold=0.9)
+    history = retriever.retrieve_history("where user lived", threshold=0.9)
+
+    assert [result.memory.id for result in current] == [new_id]
+    assert [result.memory.id for result in history] == [old_id]
 
 
 @pytest.mark.parametrize("query", ["", "   ", None])

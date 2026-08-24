@@ -4,11 +4,19 @@ from typing import Any, Dict, Literal, Protocol
 from memkernel.extractor import ExtractedResult
 
 
+MemoryState = Literal["ACTIVE", "SUPERSEDED"]
+
+
 @dataclass(frozen=True, slots=True)
 class MemoryRecord:
     id: str
     content: str
     created_at: str
+    state: MemoryState = "ACTIVE"
+    # old memory will have this.
+    superseded_by_id: str | None = None
+    # what time did  it die
+    superseded_at: str | None = None
 
 
 # semantic  search result
@@ -19,6 +27,7 @@ class ScoredMemory:
 
 
 MemoryAction = Literal["ADD", "NOOP", "SUPERSEDE"]
+MemoryRelation = Literal["EQUIVALENT", "SUPERSEDES", "DISTINCT"]
 
 
 @dataclass(frozen=True, slots=True)
@@ -42,5 +51,9 @@ class Backend(Protocol):
     def query_by(self, query_dict: Dict[str, Any]) -> MemoryRecord | None: ...
 
     def search_similar(self, content: str, top_k: int = 5) -> list[ScoredMemory]: ...
+
+    def search_current(self, content: str, top_k: int = 5) -> list[ScoredMemory]: ...
+
+    def search_history(self, content: str, top_k: int = 5) -> list[ScoredMemory]: ...
 
     def list_memories(self) -> list[MemoryRecord]: ...

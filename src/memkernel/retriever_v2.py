@@ -1,3 +1,4 @@
+from collections.abc import Callable
 from dataclasses import dataclass
 from typing import Protocol
 
@@ -5,7 +6,9 @@ from memkernel.backend.backend import MemoryRecord, ScoredMemory
 
 
 class SemanticSearchBackend(Protocol):
-    def search_similar(self, content: str, top_k: int = 5) -> list[ScoredMemory]: ...
+    def search_current(self, content: str, top_k: int = 5) -> list[ScoredMemory]: ...
+
+    def search_history(self, content: str, top_k: int = 5) -> list[ScoredMemory]: ...
 
 
 @dataclass(frozen=True, slots=True)
@@ -26,6 +29,43 @@ class SemanticRetriever:
         top_k: int = 5,
         threshold: float = 0.5,
     ) -> list[RetrievalResult]:
+        """Retrieve current memories. Kept as the default retrieval API."""
+        return self.retrieve_current(query, top_k=top_k, threshold=threshold)
+
+    def retrieve_current(
+        self,
+        query: str,
+        top_k: int = 5,
+        threshold: float = 0.5,
+    ) -> list[RetrievalResult]:
+        return self._retrieve(
+            self.memory_backend.search_current,
+            query,
+            top_k=top_k,
+            threshold=threshold,
+        )
+
+    def retrieve_history(
+        self,
+        query: str,
+        top_k: int = 5,
+        threshold: float = 0.5,
+    ) -> list[RetrievalResult]:
+        return self._retrieve(
+            self.memory_backend.search_history,
+            query,
+            top_k=top_k,
+            threshold=threshold,
+        )
+
+    @staticmethod
+    def _retrieve(
+        search: Callable[..., list[ScoredMemory]],
+        query: str,
+        *,
+        top_k: int,
+        threshold: float,
+    ) -> list[RetrievalResult]:
         if not isinstance(query, str) or not query.strip():
             raise ValueError("query must be a non-empty string")
         if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0:
@@ -35,7 +75,7 @@ class SemanticRetriever:
         if not -1.0 <= threshold <= 1.0:
             raise ValueError("threshold must be between -1 and 1")
 
-        matches = self.memory_backend.search_similar(
+        matches = search(
             query.strip(),
             top_k=top_k,
         )

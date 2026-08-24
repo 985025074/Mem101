@@ -3,7 +3,11 @@ import json
 import pytest
 
 from memkernel.backend.backend import MemoryDecision, ScoredMemory
-from memkernel.backend.backend_v2 import BackendV2, COMPARE_PROMPT
+from memkernel.backend.backend_v2 import (
+    BackendV2,
+    COMPARE_PROMPT,
+    RECONCILE_PROMPT,
+)
 from memkernel.extractor.extractor import SimpleExtractedResult
 from memkernel.extractor.extractor_v2 import JsonExtractedResult
 
@@ -42,7 +46,7 @@ class MappingEmbeddingProvider:
 
 class CandidateAwareAI(RecordingAI):
     def __init__(self, equivalent_content: str):
-        super().__init__('{"equivalent": false}')
+        super().__init__('{"relation": "DISTINCT"}')
         self.equivalent_content = equivalent_content
 
     def get_ai_response(
@@ -50,8 +54,12 @@ class CandidateAwareAI(RecordingAI):
     ) -> str:
         self.call_count += 1
         payload = json.loads(input_text)
-        equivalent = payload["fact_b"] == self.equivalent_content
-        return json.dumps({"equivalent": equivalent})
+        relation = (
+            "EQUIVALENT"
+            if payload["existing_fact"] == self.equivalent_content
+            else "DISTINCT"
+        )
+        return json.dumps({"relation": relation})
 
 
 def extracted_result(*facts: str) -> JsonExtractedResult:
@@ -66,7 +74,7 @@ def extracted_result(*facts: str) -> JsonExtractedResult:
         ('{"equivalent": false}', False),
     ],
 )
-def test_compare_two_things_parses_llm_decision(
+def test_compare_two_things_preserves_boolean_contract(
     tmp_path, response: str, expected: bool
 ) -> None:
     ai = RecordingAI(response)
@@ -85,6 +93,33 @@ def test_compare_two_things_parses_llm_decision(
     }
 
 
+@pytest.mark.parametrize(
+    ("response", "expected"),
+    [
+        ('{"relation": "EQUIVALENT"}', "EQUIVALENT"),
+        ('{"relation": "SUPERSEDES"}', "SUPERSEDES"),
+        ('{"relation": "DISTINCT"}', "DISTINCT"),
+    ],
+)
+def test_classify_relationship_parses_llm_decision(
+    tmp_path, response: str, expected: str
+) -> None:
+    ai = RecordingAI(response)
+    backend = BackendV2(tmp_path / "memory.db", ai_provider=ai)
+
+    result = backend._classify_relationship(
+        "User likes programming in Rust.",
+        "The user enjoys Rust programming.",
+    )
+
+    assert result == expected
+    assert ai.instruction == RECONCILE_PROMPT
+    assert json.loads(ai.input_text) == {
+        "new_fact": "User likes programming in Rust.",
+        "existing_fact": "The user enjoys Rust programming.",
+    }
+
+
 def test_compare_two_things_skips_llm_for_exact_normalized_match(tmp_path) -> None:
     ai = RecordingAI('{"equivalent": false}')
     backend = BackendV2(tmp_path / "memory.db", ai_provider=ai)
@@ -100,11 +135,13 @@ def test_compare_two_things_skips_llm_for_exact_normalized_match(tmp_path) -> No
         "{}",
         "null",
         "[]",
-        '{"equivalent": "true"}',
-        '{"equivalent": true, "reason": "same"}',
+        '{"equivalent": true}',
+        '{"relation": "UNKNOWN"}',
+        '{"relation": ["DISTINCT"]}',
+        '{"relation": "EQUIVALENT", "reason": "same"}',
     ],
 )
-def test_compare_two_things_rejects_invalid_llm_output(
+def test_classify_relationship_rejects_invalid_llm_output(
     tmp_path, response: str
 ) -> None:
     backend = BackendV2(
@@ -113,24 +150,24 @@ def test_compare_two_things_rejects_invalid_llm_output(
     )
 
     with pytest.raises(ValueError, match="LLM comparison response"):
-        backend._compare_two_things("User likes Rust.", "User enjoys Rust.")
+        backend._classify_relationship("User likes Rust.", "User enjoys Rust.")
 
 
 @pytest.mark.parametrize(("a", "b"), [("", "fact"), ("fact", "  ")])
-def test_compare_two_things_rejects_empty_facts(tmp_path, a: str, b: str) -> None:
+def test_classify_relationship_rejects_empty_facts(tmp_path, a: str, b: str) -> None:
     backend = BackendV2(
         tmp_path / "memory.db",
-        ai_provider=RecordingAI('{"equivalent": true}'),
+        ai_provider=RecordingAI('{"relation": "EQUIVALENT"}'),
     )
 
     with pytest.raises(ValueError, match="non-empty string"):
-        backend._compare_two_things(a, b)
+        backend._classify_relationship(a, b)
 
 
 def test_remember_adds_a_new_fact(tmp_path) -> None:
     backend = BackendV2(
         tmp_path / "memory.db",
-        ai_provider=RecordingAI('{"equivalent": false}'),
+        ai_provider=RecordingAI('{"relation": "DISTINCT"}'),
         embedding_provider=StaticEmbeddingProvider(),
     )
 
@@ -147,7 +184,7 @@ def test_remember_adds_a_new_fact(tmp_path) -> None:
 
 
 def test_remember_returns_noop_for_equivalent_fact(tmp_path) -> None:
-    ai = RecordingAI('{"equivalent": true}')
+    ai = RecordingAI('{"relation": "EQUIVALENT"}')
     backend = BackendV2(
         tmp_path / "memory.db",
         ai_provider=ai,
@@ -171,10 +208,71 @@ def test_remember_returns_noop_for_equivalent_fact(tmp_path) -> None:
     assert ai.call_count == 1
 
 
+def test_remember_supersedes_an_outdated_memory(tmp_path) -> None:
+    backend = BackendV2(
+        tmp_path / "memory.db",
+        ai_provider=RecordingAI('{"relation": "SUPERSEDES"}'),
+        embedding_provider=StaticEmbeddingProvider(),
+    )
+    old_id = backend.sqlite_backend.insert("User lives in Shanghai.")
+
+    decisions = backend.remember(extracted_result("User now lives in Beijing."))
+
+    assert decisions == [
+        MemoryDecision(
+            action="SUPERSEDE",
+            fact="User now lives in Beijing.",
+            memory_id=decisions[0].memory_id,
+            matched_memory_id=old_id,
+        )
+    ]
+    new_id = decisions[0].memory_id
+    assert new_id is not None
+
+    old_memory = backend.get(old_id)
+    new_memory = backend.get(new_id)
+    assert old_memory is not None
+    assert old_memory.state == "SUPERSEDED"
+    assert old_memory.superseded_by_id == new_id
+    assert old_memory.superseded_at is not None
+    assert new_memory is not None
+    assert new_memory.state == "ACTIVE"
+
+    assert [result.memory.id for result in backend.search_current("where user lives")] == [
+        new_id
+    ]
+    assert [result.memory.id for result in backend.search_history("where user lived")] == [
+        old_id
+    ]
+    assert len(backend.list_memories()) == 2
+
+
+def test_reconciliation_compares_only_with_current_memories(tmp_path) -> None:
+    ai = RecordingAI('{"relation": "SUPERSEDES"}')
+    backend = BackendV2(
+        tmp_path / "memory.db",
+        ai_provider=ai,
+        embedding_provider=StaticEmbeddingProvider(),
+        candidate_limit=5,
+    )
+    old_id = backend.sqlite_backend.insert("User lived in Shanghai.")
+    current_id = backend.sqlite_backend.supersede(
+        old_id,
+        "User lives in Beijing.",
+    )
+
+    decisions = backend.remember(extracted_result("User now lives in Shenzhen."))
+
+    assert decisions[0].action == "SUPERSEDE"
+    assert decisions[0].matched_memory_id == current_id
+    assert ai.call_count == 1
+    assert json.loads(ai.input_text)["existing_fact"] == "User lives in Beijing."
+
+
 def test_remember_adds_distinct_but_similar_fact(tmp_path) -> None:
     backend = BackendV2(
         tmp_path / "memory.db",
-        ai_provider=RecordingAI('{"equivalent": false}'),
+        ai_provider=RecordingAI('{"relation": "DISTINCT"}'),
         embedding_provider=StaticEmbeddingProvider(),
     )
     existing_id = backend.sqlite_backend.insert("User likes Rust.")
@@ -214,7 +312,7 @@ def test_remember_checks_more_than_the_first_candidate(tmp_path) -> None:
 def test_remember_handles_multiple_facts(tmp_path) -> None:
     backend = BackendV2(
         tmp_path / "memory.db",
-        ai_provider=RecordingAI('{"equivalent": false}'),
+        ai_provider=RecordingAI('{"relation": "DISTINCT"}'),
         embedding_provider=StaticEmbeddingProvider(),
     )
 
@@ -229,7 +327,7 @@ def test_remember_handles_multiple_facts(tmp_path) -> None:
 def test_remember_requires_v2_extracted_result(tmp_path) -> None:
     backend = BackendV2(
         tmp_path / "memory.db",
-        ai_provider=RecordingAI('{"equivalent": false}'),
+        ai_provider=RecordingAI('{"relation": "DISTINCT"}'),
         embedding_provider=StaticEmbeddingProvider(),
     )
 
@@ -240,7 +338,7 @@ def test_remember_requires_v2_extracted_result(tmp_path) -> None:
 def test_remember_requires_embedding_provider(tmp_path) -> None:
     backend = BackendV2(
         tmp_path / "memory.db",
-        ai_provider=RecordingAI('{"equivalent": false}'),
+        ai_provider=RecordingAI('{"relation": "DISTINCT"}'),
     )
 
     with pytest.raises(RuntimeError, match="embedding_provider"):
@@ -250,7 +348,7 @@ def test_remember_requires_embedding_provider(tmp_path) -> None:
 def test_remember_returns_empty_decisions_for_no_facts(tmp_path) -> None:
     backend = BackendV2(
         tmp_path / "memory.db",
-        ai_provider=RecordingAI('{"equivalent": false}'),
+        ai_provider=RecordingAI('{"relation": "DISTINCT"}'),
         embedding_provider=StaticEmbeddingProvider(),
     )
 
@@ -269,7 +367,7 @@ def test_remember_returns_empty_decisions_for_no_facts(tmp_path) -> None:
 def test_remember_rejects_invalid_fact_lists(tmp_path, payload) -> None:
     backend = BackendV2(
         tmp_path / "memory.db",
-        ai_provider=RecordingAI('{"equivalent": false}'),
+        ai_provider=RecordingAI('{"relation": "DISTINCT"}'),
         embedding_provider=StaticEmbeddingProvider(),
     )
     extracted = JsonExtractedResult(json.dumps(payload), payload)
@@ -281,7 +379,7 @@ def test_remember_rejects_invalid_fact_lists(tmp_path, payload) -> None:
 def test_decide_does_not_write_before_decision_is_applied(tmp_path) -> None:
     backend = BackendV2(
         tmp_path / "memory.db",
-        ai_provider=RecordingAI('{"equivalent": false}'),
+        ai_provider=RecordingAI('{"relation": "DISTINCT"}'),
         embedding_provider=StaticEmbeddingProvider(),
     )
 
@@ -300,7 +398,7 @@ def test_decide_does_not_write_before_decision_is_applied(tmp_path) -> None:
 def test_apply_noop_resolves_to_the_matched_memory(tmp_path) -> None:
     backend = BackendV2(
         tmp_path / "memory.db",
-        ai_provider=RecordingAI('{"equivalent": true}'),
+        ai_provider=RecordingAI('{"relation": "EQUIVALENT"}'),
         embedding_provider=StaticEmbeddingProvider(),
     )
     existing_id = backend.sqlite_backend.insert("User likes Rust.")
@@ -324,10 +422,23 @@ def test_apply_noop_resolves_to_the_matched_memory(tmp_path) -> None:
     assert len(backend.list_memories()) == 1
 
 
+def test_apply_supersede_requires_a_matched_memory(tmp_path) -> None:
+    backend = BackendV2(
+        tmp_path / "memory.db",
+        ai_provider=RecordingAI('{"relation": "SUPERSEDES"}'),
+        embedding_provider=StaticEmbeddingProvider(),
+    )
+
+    with pytest.raises(ValueError, match="matched_memory_id"):
+        backend._apply_decision(
+            MemoryDecision(action="SUPERSEDE", fact="User moved.")
+        )
+
+
 def test_apply_decision_rejects_an_already_applied_decision(tmp_path) -> None:
     backend = BackendV2(
         tmp_path / "memory.db",
-        ai_provider=RecordingAI('{"equivalent": false}'),
+        ai_provider=RecordingAI('{"relation": "DISTINCT"}'),
         embedding_provider=StaticEmbeddingProvider(),
     )
     completed = backend._apply_decision(
