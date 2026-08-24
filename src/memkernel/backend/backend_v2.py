@@ -1,9 +1,11 @@
 import json
 import logging
+from collections.abc import Sequence
+from dataclasses import replace
 from pathlib import Path
 
 from memkernel.ai import AIProvider, DeepSeekAI
-from memkernel.backend.backend import MemoryDecision, MemoryRecord
+from memkernel.backend.backend import MemoryDecision, MemoryRecord, ScoredMemory
 from memkernel.backend.sqlite_adapter import SQLiteBackend
 from memkernel.embedding import EmbeddingProvider
 from memkernel.extractor.extractor import ExtractedResult
@@ -83,11 +85,12 @@ class BackendV2:
             json.dumps({"fact_a": a, "fact_b": b}, ensure_ascii=False),
         )
 
+        # try parse llm result
         try:
             payload = json.loads(response)
         except (json.JSONDecodeError, TypeError) as error:
             raise ValueError("LLM comparison response must be valid JSON") from error
-
+        # robust check
         if (
             not isinstance(payload, dict)
             or set(payload) != {"equivalent"}
@@ -98,6 +101,41 @@ class BackendV2:
             )
 
         return payload["equivalent"]
+
+    def _decide(
+        self,
+        fact: str,
+        candidates: Sequence[ScoredMemory],
+    ) -> MemoryDecision:
+        """Create a pending decision without modifying stored memories."""
+        for candidate in candidates:
+            if self._compare_two_things(fact, candidate.memory.content):
+                return MemoryDecision(
+                    action="NOOP",
+                    fact=fact,
+                    matched_memory_id=candidate.memory.id,
+                )
+
+        return MemoryDecision(action="ADD", fact=fact)
+
+    def _apply_decision(self, decision: MemoryDecision) -> MemoryDecision:
+        """Execute a pending decision and return its completed result."""
+        if decision.memory_id is not None:
+            raise ValueError("Memory decision has already been applied")
+
+        if decision.action == "ADD":
+            memory_id = self.sqlite_backend.insert(decision.fact)
+            return replace(decision, memory_id=memory_id)
+
+        if decision.action == "NOOP":
+            if decision.matched_memory_id is None:
+                raise ValueError("NOOP decision requires matched_memory_id")
+            return replace(decision, memory_id=decision.matched_memory_id)
+
+        if decision.action == "SUPERSEDE":
+            raise NotImplementedError("SUPERSEDE is not implemented yet")
+
+        raise ValueError(f"Unsupported memory action: {decision.action}")
 
     def remember(self, extracted: ExtractedResult) -> list[MemoryDecision]:
         # safety check
@@ -116,48 +154,28 @@ class BackendV2:
 
         decisions: list[MemoryDecision] = []
         for raw_fact in facts:
+            # decide each fact
             fact = raw_fact.strip()
             candidates = self.sqlite_backend.search_similar(
                 fact,
                 top_k=self.candidate_limit,
             )
+            # Already existing memory
             candidates = [
                 candidate
                 for candidate in candidates
                 if candidate.similarity >= self.similarity_threshold
             ]
 
-            matched_memory = None
-            # Judge with each one
-            for candidate in candidates:
-                if self._compare_two_things(fact, candidate.memory.content):
-                    matched_memory = candidate.memory
-                    break
+            pending_decision = self._decide(fact, candidates)
+            completed_decision = self._apply_decision(pending_decision)
+            decisions.append(completed_decision)
 
-            if matched_memory is not None:
-                # Already exists
+            if completed_decision.action == "NOOP":
                 logger.debug(
                     "Skipping equivalent fact; matched memory %s",
-                    matched_memory.id,
+                    completed_decision.matched_memory_id,
                 )
-                decisions.append(
-                    MemoryDecision(
-                        action="NOOP",
-                        fact=fact,
-                        memory_id=matched_memory.id,
-                        matched_memory_id=matched_memory.id,
-                    )
-                )
-                continue
-
-            memory_id = self.sqlite_backend.insert(fact)
-            decisions.append(
-                MemoryDecision(
-                    action="ADD",
-                    fact=fact,
-                    memory_id=memory_id,
-                )
-            )
 
         return decisions
 
@@ -167,6 +185,9 @@ class BackendV2:
 
     def remove(self, memory_id: str) -> bool:
         return self.sqlite_backend.remove(memory_id)
+
+    def search_similar(self, content: str, top_k: int = 5) -> list[ScoredMemory]:
+        return self.sqlite_backend.search_similar(content, top_k=top_k)
 
     def list_memories(self) -> list[MemoryRecord]:
         return self.sqlite_backend.list_memories()

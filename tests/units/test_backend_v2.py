@@ -2,7 +2,7 @@ import json
 
 import pytest
 
-from memkernel.backend.backend import MemoryDecision
+from memkernel.backend.backend import MemoryDecision, ScoredMemory
 from memkernel.backend.backend_v2 import BackendV2, COMPARE_PROMPT
 from memkernel.extractor.extractor import SimpleExtractedResult
 from memkernel.extractor.extractor_v2 import JsonExtractedResult
@@ -276,3 +276,63 @@ def test_remember_rejects_invalid_fact_lists(tmp_path, payload) -> None:
 
     with pytest.raises(ValueError, match="facts|fact"):
         backend.remember(extracted)
+
+
+def test_decide_does_not_write_before_decision_is_applied(tmp_path) -> None:
+    backend = BackendV2(
+        tmp_path / "memory.db",
+        ai_provider=RecordingAI('{"equivalent": false}'),
+        embedding_provider=StaticEmbeddingProvider(),
+    )
+
+    decision = backend._decide("User likes Rust.", [])
+
+    assert decision == MemoryDecision(action="ADD", fact="User likes Rust.")
+    assert backend.list_memories() == []
+
+    completed = backend._apply_decision(decision)
+
+    assert completed.action == "ADD"
+    assert completed.memory_id is not None
+    assert backend.get(completed.memory_id).content == "User likes Rust."
+
+
+def test_apply_noop_resolves_to_the_matched_memory(tmp_path) -> None:
+    backend = BackendV2(
+        tmp_path / "memory.db",
+        ai_provider=RecordingAI('{"equivalent": true}'),
+        embedding_provider=StaticEmbeddingProvider(),
+    )
+    existing_id = backend.sqlite_backend.insert("User likes Rust.")
+    existing_memory = backend.get(existing_id)
+    assert existing_memory is not None
+
+    decision = backend._decide(
+        "The user enjoys Rust programming.",
+        [ScoredMemory(memory=existing_memory, similarity=1.0)],
+    )
+
+    assert decision == MemoryDecision(
+        action="NOOP",
+        fact="The user enjoys Rust programming.",
+        matched_memory_id=existing_id,
+    )
+
+    completed = backend._apply_decision(decision)
+
+    assert completed.memory_id == existing_id
+    assert len(backend.list_memories()) == 1
+
+
+def test_apply_decision_rejects_an_already_applied_decision(tmp_path) -> None:
+    backend = BackendV2(
+        tmp_path / "memory.db",
+        ai_provider=RecordingAI('{"equivalent": false}'),
+        embedding_provider=StaticEmbeddingProvider(),
+    )
+    completed = backend._apply_decision(
+        MemoryDecision(action="ADD", fact="User likes Rust.")
+    )
+
+    with pytest.raises(ValueError, match="already been applied"):
+        backend._apply_decision(completed)

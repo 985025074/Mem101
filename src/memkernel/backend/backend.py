@@ -25,10 +25,9 @@ MemoryAction = Literal["ADD", "NOOP", "SUPERSEDE"]
 class MemoryDecision:
     action: MemoryAction
     fact: str
-    # If already exists,this is the existing id
-    # otherwise new id
-    memory_id: str
-    # for new memory it is none
+    # Populated by _apply_decision after the action has been executed.
+    memory_id: str | None = None
+    # Existing memory selected by reconciliation, if any.
     matched_memory_id: str | None = None
 
 
