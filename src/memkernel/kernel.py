@@ -5,10 +5,9 @@
 from dataclasses import dataclass, field
 from typing import Optional
 
-from memkernel.backend import Backend
+from memkernel.backend import Backend, SQLiteBackend
 from memkernel.extractor import Extractor, LLMExtractor
 from memkernel.retriver import Retriver, SimpleRetriver
-from memkernel.sqlite_adapter import SQLiteBackend
 
 
 @dataclass(slots=True)

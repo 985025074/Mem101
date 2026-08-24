@@ -4,6 +4,7 @@ from .extractor import ExtractedResult
 
 
 # replace time with real time.
+# TODO: add last 20 messages to prompt to help performance?
 EXTRACTOR_PROMPT = f"""
 You are MemKernel's memory extractor. Convert the input message into a small
 set of durable facts that may be useful in future conversations.
@@ -51,4 +52,6 @@ class LLMExtractorV2:
         result = self.llm.get_ai_response(
             self.client, inst=self.llm_prompt, input_text=given_info
         )
-        return ExtractedResult(result)
+        return ExtractedResult(
+            result,
+        )

@@ -1,4 +1,5 @@
 import sqlite3
+from typing import Any, Dict
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
@@ -9,6 +10,8 @@ from memkernel.extractor import ExtractedResult
 
 
 class SQLiteBackend:
+    _QUERYABLE_COLUMNS = frozenset({"id", "content", "created_at"})
+
     def __init__(
         self,
         database_path: str | Path = "memkernel.db",
@@ -70,6 +73,50 @@ class SQLiteBackend:
                 WHERE id = ?
                 """,
                 (memory_id,),
+            ).fetchone()
+
+        if row is None:
+            return None
+
+        return MemoryRecord(
+            id=row["id"],
+            content=row["content"],
+            created_at=row["created_at"],
+        )
+
+    def query_by(self, query_dict: Dict[str, Any]) -> MemoryRecord | None:
+        """Return the newest memory that exactly matches every supplied field."""
+        if not query_dict:
+            raise ValueError("query_dict must contain at least one field")
+
+        invalid_columns = set(query_dict) - self._QUERYABLE_COLUMNS
+        if invalid_columns:
+            invalid = ", ".join(sorted(invalid_columns))
+            allowed = ", ".join(sorted(self._QUERYABLE_COLUMNS))
+            raise ValueError(
+                f"Unsupported query column(s): {invalid}. Allowed columns: {allowed}"
+            )
+
+        conditions: list[str] = []
+        values: list[Any] = []
+        for key, value in query_dict.items():
+            if value is None:
+                conditions.append(f"{key} IS NULL")
+            else:
+                conditions.append(f"{key} = ?")
+                values.append(value)
+
+        where_clause = " AND ".join(conditions)
+        with self._connect() as connection:
+            row = connection.execute(
+                f"""
+                SELECT id, content, created_at
+                FROM memories
+                WHERE {where_clause}
+                ORDER BY created_at DESC, rowid DESC
+                LIMIT 1
+                """,
+                values,
             ).fetchone()
 
         if row is None:
