@@ -1,15 +1,20 @@
 import json
+import sqlite3
+import uuid
 
 import pytest
 
 from memkernel.backend.backend import MemoryDecision, ScoredMemory
 from memkernel.backend.backend_v2 import (
     BackendV2,
-    COMPARE_PROMPT,
     RECONCILE_PROMPT,
 )
 from memkernel.extractor.extractor import SimpleExtractedResult
-from memkernel.extractor.extractor_v2 import JsonExtractedResult
+from memkernel.extractor.extractor_v2 import (
+    ExtractedFact,
+    JsonExtractedResult,
+)
+from memkernel.provenance import SourceEvent
 
 
 class RecordingAI:
@@ -63,34 +68,52 @@ class CandidateAwareAI(RecordingAI):
 
 
 def extracted_result(*facts: str) -> JsonExtractedResult:
-    payload = {"facts": list(facts)}
-    return JsonExtractedResult(json.dumps(payload), payload)
-
-
-@pytest.mark.parametrize(
-    ("response", "expected"),
-    [
-        ('{"equivalent": true}', True),
-        ('{"equivalent": false}', False),
-    ],
-)
-def test_compare_two_things_preserves_boolean_contract(
-    tmp_path, response: str, expected: bool
-) -> None:
-    ai = RecordingAI(response)
-    backend = BackendV2(tmp_path / "memory.db", ai_provider=ai)
-
-    result = backend._compare_two_things(
-        "User likes programming in Rust.",
-        "The user enjoys Rust programming.",
+    payload = {
+        "facts": [
+            {"content": fact, "evidence": fact}
+            for fact in facts
+        ]
+    }
+    return JsonExtractedResult(
+        json.dumps(payload),
+        payload,
+        tuple(ExtractedFact(content=fact, evidence=fact) for fact in facts),
     )
 
-    assert result is expected
-    assert ai.instruction == COMPARE_PROMPT
-    assert json.loads(ai.input_text) == {
-        "fact_a": "User likes programming in Rust.",
-        "fact_b": "The user enjoys Rust programming.",
+
+def sourced_result(*facts: tuple[str, str]) -> JsonExtractedResult:
+    payload = {
+        "facts": [
+            {"content": content, "evidence": evidence}
+            for content, evidence in facts
+        ]
     }
+    return JsonExtractedResult(
+        json.dumps(payload),
+        payload,
+        tuple(
+            ExtractedFact(content=content, evidence=evidence)
+            for content, evidence in facts
+        ),
+    )
+
+
+def source_event(source_id: str, content: str) -> SourceEvent:
+    return SourceEvent(
+        id=source_id,
+        content=content,
+        source_type="message",
+        role="user",
+        observed_at="2026-08-24T12:00:00+00:00",
+    )
+
+
+def remember_facts(backend: BackendV2, *facts: str) -> list[MemoryDecision]:
+    source_content = " ".join(facts) or "No durable facts."
+    return backend.remember(
+        extracted_result(*facts),
+        source_event=source_event(str(uuid.uuid4()), source_content),
+    )
 
 
 @pytest.mark.parametrize(
@@ -118,14 +141,6 @@ def test_classify_relationship_parses_llm_decision(
         "new_fact": "User likes programming in Rust.",
         "existing_fact": "The user enjoys Rust programming.",
     }
-
-
-def test_compare_two_things_skips_llm_for_exact_normalized_match(tmp_path) -> None:
-    ai = RecordingAI('{"equivalent": false}')
-    backend = BackendV2(tmp_path / "memory.db", ai_provider=ai)
-
-    assert backend._compare_two_things(" User likes Rust. ", "user likes rust.")
-    assert ai.call_count == 0
 
 
 @pytest.mark.parametrize(
@@ -171,7 +186,7 @@ def test_remember_adds_a_new_fact(tmp_path) -> None:
         embedding_provider=StaticEmbeddingProvider(),
     )
 
-    decisions = backend.remember(extracted_result("User likes Rust."))
+    decisions = remember_facts(backend, "User likes Rust.")
 
     assert decisions == [
         MemoryDecision(
@@ -183,6 +198,55 @@ def test_remember_adds_a_new_fact(tmp_path) -> None:
     assert backend.get(decisions[0].memory_id).content == "User likes Rust."
 
 
+def test_sourced_add_persists_exact_evidence(tmp_path) -> None:
+    backend = BackendV2(
+        tmp_path / "memory.db",
+        ai_provider=RecordingAI('{"relation": "DISTINCT"}'),
+        embedding_provider=StaticEmbeddingProvider(),
+    )
+    source = source_event("source-1", "I like Rust")
+
+    decisions = backend.remember(
+        sourced_result(("User likes Rust.", "I like Rust")),
+        source_event=source,
+    )
+
+    assert decisions[0].action == "ADD"
+    sources = backend.get_sources(decisions[0].memory_id)
+    assert len(sources) == 1
+    assert sources[0].source.id == "source-1"
+    assert sources[0].source.content == "I like Rust"
+    assert sources[0].evidence_quote == "I like Rust"
+    assert sources[0].link_type == "DERIVED"
+
+
+def test_sourced_noop_adds_confirming_evidence(tmp_path) -> None:
+    backend = BackendV2(
+        tmp_path / "memory.db",
+        ai_provider=RecordingAI('{"relation": "EQUIVALENT"}'),
+        embedding_provider=StaticEmbeddingProvider(),
+    )
+    memory_id = backend.sqlite_backend.insert("User likes Rust.")
+
+    decision = backend.remember(
+        sourced_result(("The user enjoys Rust.", "Rust is my favorite")),
+        source_event=source_event("source-1", "Rust is my favorite"),
+    )[0]
+    backend.remember(
+        sourced_result(("User likes Rust.", "I still like Rust")),
+        source_event=source_event("source-2", "I still like Rust"),
+    )
+
+    assert decision.action == "NOOP"
+    assert decision.memory_id == memory_id
+    sources = backend.get_sources(memory_id)
+    assert sorted(source.source.id for source in sources) == [
+        "source-1",
+        "source-2",
+    ]
+    assert [source.link_type for source in sources] == ["CONFIRMED", "CONFIRMED"]
+
+
 def test_remember_returns_noop_for_equivalent_fact(tmp_path) -> None:
     ai = RecordingAI('{"relation": "EQUIVALENT"}')
     backend = BackendV2(
@@ -192,8 +256,9 @@ def test_remember_returns_noop_for_equivalent_fact(tmp_path) -> None:
     )
     existing_id = backend.sqlite_backend.insert("User likes Rust.")
 
-    decisions = backend.remember(
-        extracted_result("The user enjoys programming in Rust.")
+    decisions = remember_facts(
+        backend,
+        "The user enjoys programming in Rust.",
     )
 
     assert decisions == [
@@ -216,7 +281,7 @@ def test_remember_supersedes_an_outdated_memory(tmp_path) -> None:
     )
     old_id = backend.sqlite_backend.insert("User lives in Shanghai.")
 
-    decisions = backend.remember(extracted_result("User now lives in Beijing."))
+    decisions = remember_facts(backend, "User now lives in Beijing.")
 
     assert decisions == [
         MemoryDecision(
@@ -247,6 +312,71 @@ def test_remember_supersedes_an_outdated_memory(tmp_path) -> None:
     assert len(backend.list_memories()) == 2
 
 
+def test_sourced_supersede_keeps_old_and_new_evidence_separate(tmp_path) -> None:
+    ai = RecordingAI('{"relation": "DISTINCT"}')
+    backend = BackendV2(
+        tmp_path / "memory.db",
+        ai_provider=ai,
+        embedding_provider=StaticEmbeddingProvider(),
+    )
+    old_decision = backend.remember(
+        sourced_result(("User lives in Shanghai.", "I live in Shanghai")),
+        source_event=source_event("old-source", "I live in Shanghai"),
+    )[0]
+    ai.response = '{"relation": "SUPERSEDES"}'
+
+    new_decision = backend.remember(
+        sourced_result(("User now lives in Beijing.", "I moved to Beijing")),
+        source_event=source_event("new-source", "I moved to Beijing"),
+    )[0]
+
+    assert new_decision.action == "SUPERSEDE"
+    assert new_decision.matched_memory_id == old_decision.memory_id
+    assert [
+        source.source.id
+        for source in backend.get_sources(old_decision.memory_id)
+    ] == ["old-source"]
+    assert [
+        source.source.id
+        for source in backend.get_sources(new_decision.memory_id)
+    ] == ["new-source"]
+
+
+def test_sourced_batch_rolls_back_if_a_target_changes(tmp_path) -> None:
+    database_path = tmp_path / "memory.db"
+    backend = BackendV2(
+        database_path,
+        ai_provider=RecordingAI('{"relation": "SUPERSEDES"}'),
+        embedding_provider=StaticEmbeddingProvider(),
+        candidate_limit=1,
+    )
+    old_id = backend.sqlite_backend.insert("User lives in Shanghai.")
+    source = source_event(
+        "source-rollback",
+        "I moved to Beijing and then to Shenzhen",
+    )
+
+    with pytest.raises(RuntimeError, match="target changed"):
+        backend.remember(
+            sourced_result(
+                ("User lives in Beijing.", "moved to Beijing"),
+                ("User lives in Shenzhen.", "then to Shenzhen"),
+            ),
+            source_event=source,
+        )
+
+    old_memory = backend.get(old_id)
+    assert old_memory is not None
+    assert old_memory.state == "ACTIVE"
+    assert backend.list_memories() == [old_memory]
+    connection = sqlite3.connect(database_path)
+    source_count = connection.execute(
+        "SELECT COUNT(*) FROM source_events"
+    ).fetchone()[0]
+    connection.close()
+    assert source_count == 0
+
+
 def test_reconciliation_compares_only_with_current_memories(tmp_path) -> None:
     ai = RecordingAI('{"relation": "SUPERSEDES"}')
     backend = BackendV2(
@@ -261,7 +391,7 @@ def test_reconciliation_compares_only_with_current_memories(tmp_path) -> None:
         "User lives in Beijing.",
     )
 
-    decisions = backend.remember(extracted_result("User now lives in Shenzhen."))
+    decisions = remember_facts(backend, "User now lives in Shenzhen.")
 
     assert decisions[0].action == "SUPERSEDE"
     assert decisions[0].matched_memory_id == current_id
@@ -277,7 +407,7 @@ def test_remember_adds_distinct_but_similar_fact(tmp_path) -> None:
     )
     existing_id = backend.sqlite_backend.insert("User likes Rust.")
 
-    decisions = backend.remember(extracted_result("User dislikes Rust."))
+    decisions = remember_facts(backend, "User dislikes Rust.")
 
     assert decisions[0].action == "ADD"
     assert decisions[0].memory_id != existing_id
@@ -301,7 +431,7 @@ def test_remember_checks_more_than_the_first_candidate(tmp_path) -> None:
     backend.sqlite_backend.insert("User attended a Rust conference.")
     equivalent_id = backend.sqlite_backend.insert(equivalent)
 
-    decisions = backend.remember(extracted_result(new_fact))
+    decisions = remember_facts(backend, new_fact)
 
     assert decisions[0].action == "NOOP"
     assert decisions[0].matched_memory_id == equivalent_id
@@ -316,8 +446,10 @@ def test_remember_handles_multiple_facts(tmp_path) -> None:
         embedding_provider=StaticEmbeddingProvider(),
     )
 
-    decisions = backend.remember(
-        extracted_result("User likes Rust.", "User likes green tea.")
+    decisions = remember_facts(
+        backend,
+        "User likes Rust.",
+        "User likes green tea.",
     )
 
     assert [decision.action for decision in decisions] == ["ADD", "ADD"]
@@ -332,7 +464,10 @@ def test_remember_requires_v2_extracted_result(tmp_path) -> None:
     )
 
     with pytest.raises(TypeError, match="JsonExtractedResult"):
-        backend.remember(SimpleExtractedResult("User likes Rust."))
+        backend.remember(
+            SimpleExtractedResult("User likes Rust."),
+            source_event=source_event("source", "User likes Rust."),
+        )
 
 
 def test_remember_requires_embedding_provider(tmp_path) -> None:
@@ -342,7 +477,7 @@ def test_remember_requires_embedding_provider(tmp_path) -> None:
     )
 
     with pytest.raises(RuntimeError, match="embedding_provider"):
-        backend.remember(extracted_result("User likes Rust."))
+        remember_facts(backend, "User likes Rust.")
 
 
 def test_remember_returns_empty_decisions_for_no_facts(tmp_path) -> None:
@@ -352,28 +487,28 @@ def test_remember_returns_empty_decisions_for_no_facts(tmp_path) -> None:
         embedding_provider=StaticEmbeddingProvider(),
     )
 
-    assert backend.remember(extracted_result()) == []
+    assert remember_facts(backend) == []
 
 
-@pytest.mark.parametrize(
-    "payload",
-    [
-        {},
-        {"facts": "User likes Rust."},
-        {"facts": [""]},
-        {"facts": [123]},
-    ],
-)
-def test_remember_rejects_invalid_fact_lists(tmp_path, payload) -> None:
+def test_empty_sourced_extraction_does_not_store_source(tmp_path) -> None:
+    database_path = tmp_path / "memory.db"
     backend = BackendV2(
-        tmp_path / "memory.db",
+        database_path,
         ai_provider=RecordingAI('{"relation": "DISTINCT"}'),
         embedding_provider=StaticEmbeddingProvider(),
     )
-    extracted = JsonExtractedResult(json.dumps(payload), payload)
 
-    with pytest.raises(ValueError, match="facts|fact"):
-        backend.remember(extracted)
+    assert backend.remember(
+        sourced_result(),
+        source_event=source_event("unused-source", "Hello"),
+    ) == []
+
+    connection = sqlite3.connect(database_path)
+    source_count = connection.execute(
+        "SELECT COUNT(*) FROM source_events"
+    ).fetchone()[0]
+    connection.close()
+    assert source_count == 0
 
 
 def test_decide_does_not_write_before_decision_is_applied(tmp_path) -> None:

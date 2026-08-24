@@ -2,9 +2,11 @@ import sqlite3
 
 import pytest
 
+from memkernel.backend.backend import MemoryDecision
 from memkernel.backend.sqlite_adapter import SQLiteBackend
 from memkernel.embedding import OpenAIEmbeddingProvider
 from memkernel.extractor.extractor import SimpleExtractedResult
+from memkernel.provenance import SourceEvent
 
 
 class StaticEmbeddingProvider:
@@ -17,6 +19,16 @@ class FailingNewMemoryEmbeddingProvider:
         if text == "New memory.":
             return []
         return [1.0, 0.0]
+
+
+def source_event(source_id: str, content: str) -> SourceEvent:
+    return SourceEvent(
+        id=source_id,
+        content=content,
+        source_type="message",
+        role="user",
+        observed_at="2026-08-24T12:00:00+00:00",
+    )
 
 
 @pytest.fixture
@@ -94,6 +106,38 @@ def test_remove_also_removes_embedding(tmp_path) -> None:
 
     assert backend.remove(memory_id) is True
     assert backend.search_similar("Rust preference") == []
+
+
+def test_shared_source_lives_until_its_last_memory_is_removed(tmp_path) -> None:
+    database_path = tmp_path / "source-lifecycle.db"
+    backend = SQLiteBackend(
+        database_path,
+        embedding_provider=StaticEmbeddingProvider(),
+    )
+    completed = backend.apply_decisions(
+        source_event("shared-source", "I like Rust and tea"),
+        [
+            (MemoryDecision(action="ADD", fact="User likes Rust."), "like Rust"),
+            (MemoryDecision(action="ADD", fact="User likes tea."), "tea"),
+        ],
+    )
+    first_id = completed[0].memory_id
+    second_id = completed[1].memory_id
+    assert first_id is not None
+    assert second_id is not None
+
+    assert backend.remove(first_id) is True
+    assert [source.source.id for source in backend.get_sources(second_id)] == [
+        "shared-source"
+    ]
+
+    assert backend.remove(second_id) is True
+    connection = sqlite3.connect(database_path)
+    source_count = connection.execute(
+        "SELECT COUNT(*) FROM source_events"
+    ).fetchone()[0]
+    connection.close()
+    assert source_count == 0
 
 
 def test_supersede_keeps_the_old_memory_and_embedding(tmp_path) -> None:
@@ -210,6 +254,15 @@ def test_existing_database_is_migrated_with_active_memories(tmp_path) -> None:
     assert memory.state == "ACTIVE"
     assert memory.superseded_by_id is None
     assert memory.superseded_at is None
+    connection = sqlite3.connect(database_path)
+    tables = {
+        row[0]
+        for row in connection.execute(
+            "SELECT name FROM sqlite_master WHERE type = 'table'"
+        ).fetchall()
+    }
+    connection.close()
+    assert {"source_events", "memory_sources"} <= tables
 
 
 def test_embedding(backend: SQLiteBackend):

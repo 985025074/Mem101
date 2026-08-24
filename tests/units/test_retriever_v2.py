@@ -1,8 +1,7 @@
 import pytest
 
 from memkernel.backend.backend import MemoryRecord, ScoredMemory
-from memkernel.backend.backend_v2 import BackendV2
-from memkernel.retriever_v2 import RetrievalResult, SemanticRetriever
+from memkernel.retriever_v2 import RecallResults, RetrievalResult, SemanticRetriever
 
 
 def memory(memory_id: str, content: str) -> MemoryRecord:
@@ -23,15 +22,11 @@ class FakeSemanticBackend:
         self.historical_matches = historical_matches or []
         self.calls: list[tuple[str, str, int]] = []
 
-    def search_current(
-        self, content: str, top_k: int = 5
-    ) -> list[ScoredMemory]:
+    def search_current(self, content: str, top_k: int = 5) -> list[ScoredMemory]:
         self.calls.append(("current", content, top_k))
         return self.matches
 
-    def search_history(
-        self, content: str, top_k: int = 5
-    ) -> list[ScoredMemory]:
+    def search_history(self, content: str, top_k: int = 5) -> list[ScoredMemory]:
         self.calls.append(("history", content, top_k))
         return self.historical_matches
 
@@ -45,9 +40,7 @@ class UnusedAI:
     def get_client(self) -> object:
         return object()
 
-    def get_ai_response(
-        self, client: object, inst: str, input_text: str
-    ) -> str:
+    def get_ai_response(self, client: object, inst: str, input_text: str) -> str:
         raise AssertionError("Retrieval must not call the LLM")
 
 
@@ -84,9 +77,7 @@ def test_retrieve_enforces_top_k_even_if_backend_returns_more() -> None:
 
 
 def test_retrieve_includes_a_score_equal_to_threshold() -> None:
-    backend = FakeSemanticBackend(
-        [ScoredMemory(memory("match", "Match"), 0.5)]
-    )
+    backend = FakeSemanticBackend([ScoredMemory(memory("match", "Match"), 0.5)])
 
     results = SemanticRetriever(backend).retrieve("query", threshold=0.5)
 
@@ -123,37 +114,40 @@ def test_current_and_history_use_independent_top_k_values() -> None:
     ]
 
 
-def test_retrieve_integrates_with_backend_v2_without_calling_llm(tmp_path) -> None:
-    backend = BackendV2(
-        tmp_path / "memory.db",
-        ai_provider=UnusedAI(),
-        embedding_provider=StaticEmbeddingProvider(),
-    )
-    memory_id = backend.sqlite_backend.insert("User likes Rust.")
-
-    results = SemanticRetriever(backend).retrieve(
-        "Rust preference",
-        threshold=0.9,
+def test_recall_returns_separate_current_and_history_results() -> None:
+    backend = FakeSemanticBackend(
+        [ScoredMemory(memory("current", "Current"), 0.9)],
+        historical_matches=[ScoredMemory(memory("history", "History"), 0.8)],
     )
 
-    assert [result.memory.id for result in results] == [memory_id]
-
-
-def test_history_retrieval_integrates_with_backend_v2(tmp_path) -> None:
-    backend = BackendV2(
-        tmp_path / "memory.db",
-        ai_provider=UnusedAI(),
-        embedding_provider=StaticEmbeddingProvider(),
+    results = SemanticRetriever(backend).recall(
+        "preference",
+        current_top_k=1,
+        history_top_k=2,
+        threshold=0.7,
     )
-    old_id = backend.sqlite_backend.insert("User lived in Shanghai.")
-    new_id = backend.sqlite_backend.supersede(old_id, "User lives in Beijing.")
-    retriever = SemanticRetriever(backend)
 
-    current = retriever.retrieve_current("where user lives", threshold=0.9)
-    history = retriever.retrieve_history("where user lived", threshold=0.9)
+    assert results == RecallResults(
+        current=[RetrievalResult(memory("current", "Current"), 0.9)],
+        history=[RetrievalResult(memory("history", "History"), 0.8)],
+    )
+    assert backend.calls == [
+        ("current", "preference", 1),
+        ("history", "preference", 2),
+    ]
 
-    assert [result.memory.id for result in current] == [new_id]
-    assert [result.memory.id for result in history] == [old_id]
+
+def test_recall_does_not_search_history_by_default() -> None:
+    backend = FakeSemanticBackend(
+        [ScoredMemory(memory("current", "Current"), 0.9)],
+        historical_matches=[ScoredMemory(memory("history", "History"), 0.8)],
+    )
+
+    results = SemanticRetriever(backend).recall("preference")
+
+    assert [result.memory.id for result in results.current] == ["current"]
+    assert results.history == []
+    assert backend.calls == [("current", "preference", 5)]
 
 
 @pytest.mark.parametrize("query", ["", "   ", None])
@@ -172,9 +166,17 @@ def test_retrieve_rejects_invalid_top_k(top_k) -> None:
         retriever.retrieve("query", top_k=top_k)
 
 
-@pytest.mark.parametrize("threshold", [-1.1, 1.1, "0.5", True])
+@pytest.mark.parametrize("threshold", [-1.1, -0.1, 1.1, "0.5", True])
 def test_retrieve_rejects_invalid_threshold(threshold) -> None:
     retriever = SemanticRetriever(FakeSemanticBackend([]))
 
     with pytest.raises(ValueError, match="threshold"):
         retriever.retrieve("query", threshold=threshold)
+
+
+@pytest.mark.parametrize("history_top_k", [-1, 1.5, True])
+def test_recall_rejects_invalid_history_top_k(history_top_k) -> None:
+    retriever = SemanticRetriever(FakeSemanticBackend([]))
+
+    with pytest.raises(ValueError, match="history_top_k"):
+        retriever.recall("query", history_top_k=history_top_k)
