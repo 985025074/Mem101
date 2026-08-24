@@ -4,8 +4,15 @@ from typing import Protocol
 from memkernel.ai import AIProvider, DeepSeekAI
 
 
+class ExtractedResult(Protocol):
+    # content: str
+    # in protocol if we want to define a field use method instead of @dataclass
+    @property
+    def content(self) -> str: ...
+
+
 @dataclass(slots=True, frozen=True)
-class ExtractedResult:
+class SimpleExtractedResult:
     content: str
 
 
@@ -25,4 +32,4 @@ class LLMExtractor:
         result = self.llm.get_ai_response(
             self.client, inst=self.llm_prompt, input_text=given_info
         )
-        return ExtractedResult(result)
+        return SimpleExtractedResult(result)

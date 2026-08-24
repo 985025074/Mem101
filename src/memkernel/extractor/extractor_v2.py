@@ -1,3 +1,7 @@
+import json
+from typing import Any, Dict
+from dataclasses import dataclass
+
 from memkernel.ai import AIProvider, DeepSeekAI
 from memkernel.utility.time_helper import now
 from .extractor import ExtractedResult
@@ -42,6 +46,12 @@ Output: {{"facts": ["User likes Rust.", "User is building a small memory system.
 """.strip()
 
 
+@dataclass(slots=True, frozen=True)
+class JsonExtractedResult:
+    content: str
+    parsed_dict: Dict[Any, Any]
+
+
 class LLMExtractorV2:
     def __init__(self, llm: AIProvider = DeepSeekAI()):
         self.llm: AIProvider = llm
@@ -52,6 +62,8 @@ class LLMExtractorV2:
         result = self.llm.get_ai_response(
             self.client, inst=self.llm_prompt, input_text=given_info
         )
-        return ExtractedResult(
+        parsed_dict = json.loads(result)
+        return JsonExtractedResult(
             result,
+            parsed_dict,
         )

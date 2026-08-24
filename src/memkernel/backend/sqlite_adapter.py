@@ -1,11 +1,14 @@
 import sqlite3
-from typing import Any, Dict
 import uuid
 from collections.abc import Iterator
 from contextlib import contextmanager
 from pathlib import Path
+from typing import Any, Dict
 
-from memkernel.backend import MemoryRecord
+import sqlite_vec
+
+from memkernel.backend.backend import MemoryRecord, ScoredMemory
+from memkernel.embedding import EmbeddingProvider
 from memkernel.extractor import ExtractedResult
 
 
@@ -15,8 +18,10 @@ class SQLiteBackend:
     def __init__(
         self,
         database_path: str | Path = "memkernel.db",
+        embedding_provider: EmbeddingProvider | None = None,
     ):
         self.database_path = Path(database_path)
+        self.embedding_provider = embedding_provider
         self._initialize()
 
     @contextmanager
@@ -24,6 +29,13 @@ class SQLiteBackend:
         connection = sqlite3.connect(self.database_path, timeout=5)
         connection.row_factory = sqlite3.Row
         connection.execute("PRAGMA foreign_keys = ON")
+        # semantic search extenstion
+        if self.embedding_provider is not None:
+            connection.enable_load_extension(True)
+            try:
+                sqlite_vec.load(connection)
+            finally:
+                connection.enable_load_extension(False)
 
         try:
             yield connection
@@ -49,9 +61,33 @@ class SQLiteBackend:
                 )
                 """
             )
+            # memory seamantic embedding queried by memory id
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS memory_embeddings (
+                    memory_id TEXT PRIMARY KEY,
+                    dimensions INTEGER NOT NULL CHECK (dimensions > 0),
+                    embedding BLOB NOT NULL,
+                    FOREIGN KEY (memory_id) REFERENCES memories(id)
+                        ON DELETE CASCADE
+                )
+                """
+            )
 
-    def remember(self, extracted: ExtractedResult) -> str:
+    def _create_embedding(self, content: str) -> list[float]:
+        """Get embedding of a string"""
+        if self.embedding_provider is None:
+            raise RuntimeError("Semantic search requires an embedding_provider")
+
+        embedding = [float(value) for value in self.embedding_provider.embed(content)]
+
+        return embedding
+
+    def insert(self, content: str) -> str:
         memory_id = str(uuid.uuid4())
+        embedding = None
+        if self.embedding_provider is not None:
+            embedding = self._create_embedding(content)
 
         with self._connect() as connection:
             connection.execute(
@@ -59,10 +95,28 @@ class SQLiteBackend:
                 INSERT INTO memories (id, content)
                 VALUES (?, ?)
                 """,
-                (memory_id, extracted.content),
+                (memory_id, content),
             )
+            # insert embedding of the memory
+            if embedding is not None:
+                connection.execute(
+                    """
+                    INSERT INTO memory_embeddings (
+                        memory_id, dimensions, embedding
+                    )
+                    VALUES (?, ?, ?)
+                    """,
+                    (
+                        memory_id,
+                        len(embedding),
+                        sqlite_vec.serialize_float32(embedding),
+                    ),
+                )
 
         return memory_id
+
+    def remember(self, extracted: ExtractedResult) -> str:
+        return self.insert(extracted.content)
 
     def get(self, memory_id: str) -> MemoryRecord | None:
         with self._connect() as connection:
@@ -83,6 +137,20 @@ class SQLiteBackend:
             content=row["content"],
             created_at=row["created_at"],
         )
+
+    def remove(self, memory_id: str) -> bool:
+        """Remove a memory and its embedding, returning whether it existed."""
+        if not isinstance(memory_id, str) or not memory_id.strip():
+            raise ValueError("memory_id must be a non-empty string")
+
+        # embedding uses foreign key,We don't need to delete again
+        with self._connect() as connection:
+            cursor = connection.execute(
+                "DELETE FROM memories WHERE id = ?",
+                (memory_id,),
+            )
+
+        return cursor.rowcount > 0
 
     def query_by(self, query_dict: Dict[str, Any]) -> MemoryRecord | None:
         """Return the newest memory that exactly matches every supplied field."""
@@ -127,6 +195,70 @@ class SQLiteBackend:
             content=row["content"],
             created_at=row["created_at"],
         )
+
+    def search_similar(self, content: str, top_k: int = 5) -> list[ScoredMemory]:
+        if not content.strip():
+            raise ValueError("content must not be empty")
+        if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0:
+            raise ValueError("top_k must be a positive integer")
+
+        query_embedding = self._create_embedding(content)
+        serialized_query = sqlite_vec.serialize_float32(query_embedding)
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    m.id,
+                    m.content,
+                    m.created_at,
+                    vec_distance_cosine(e.embedding, ?) AS distance
+                FROM memory_embeddings AS e
+                JOIN memories AS m ON m.id = e.memory_id
+                WHERE e.dimensions = ?
+                ORDER BY distance ASC
+                LIMIT ?
+                """,
+                (serialized_query, len(query_embedding), top_k),
+            ).fetchall()
+
+        return [
+            ScoredMemory(
+                memory=MemoryRecord(
+                    id=row["id"],
+                    content=row["content"],
+                    created_at=row["created_at"],
+                ),
+                similarity=max(-1.0, min(1.0, 1.0 - float(row["distance"]))),
+            )
+            for row in rows
+        ]
+
+    def rebuild_embeddings(self) -> int:
+        """Recreate embeddings for every memory using the configured provider."""
+        embeddings = [
+            (memory.id, self._create_embedding(memory.content))
+            for memory in self.list_memories()
+        ]
+
+        with self._connect() as connection:
+            connection.execute("DELETE FROM memory_embeddings")
+            connection.executemany(
+                """
+                INSERT INTO memory_embeddings (memory_id, dimensions, embedding)
+                VALUES (?, ?, ?)
+                """,
+                [
+                    (
+                        memory_id,
+                        len(embedding),
+                        sqlite_vec.serialize_float32(embedding),
+                    )
+                    for memory_id, embedding in embeddings
+                ],
+            )
+
+        return len(embeddings)
 
     def list_memories(self) -> list[MemoryRecord]:
         with self._connect() as connection:

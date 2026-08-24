@@ -8,6 +8,7 @@ dependencies = [
     "fastapi[standard]>=0.141.1",
     "openai>=3.3.1",
     "pytest>=9.1.1",
+    "sqlite-vec>=0.1.9",
 ]
 
 [build-system]
