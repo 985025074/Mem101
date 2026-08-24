@@ -1,15 +1,30 @@
+import json
 import sqlite3
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterator, Sequence
 from contextlib import contextmanager
+from dataclasses import replace
 from pathlib import Path
 from typing import Any, Dict, cast
 
 import sqlite_vec
 
-from memkernel.backend.backend import MemoryRecord, MemoryState, ScoredMemory
+from memkernel.backend.backend import (
+    MemoryDecision,
+    MemoryRecord,
+    MemoryState,
+    ScoredMemory,
+)
 from memkernel.embedding import EmbeddingProvider
 from memkernel.extractor import ExtractedResult
+from memkernel.provenance import (
+    MemorySourceRecord,
+    SourceEvent,
+    SourceEventRecord,
+    SourceLinkType,
+    SourceRole,
+    SourceType,
+)
 
 
 class SQLiteBackend:
@@ -96,6 +111,56 @@ class SQLiteBackend:
                 )
                 """
             )
+            # source  event tables
+            # Observe at is only used for some old things.
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS source_events (
+                    id TEXT PRIMARY KEY,
+                    content TEXT NOT NULL,
+                    source_type TEXT NOT NULL
+                        CHECK (source_type IN ('message', 'tool', 'document')),
+                    role TEXT
+                        CHECK (
+                            role IS NULL OR
+                            role IN ('user', 'assistant', 'system', 'tool')
+                        ),
+                    observed_at TEXT NOT NULL,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    metadata_json TEXT NOT NULL DEFAULT '{}'
+                )
+                """
+            )
+            # one memory can have many events so we need an big table ,not only a column
+            connection.execute(
+                """
+                CREATE TABLE IF NOT EXISTS memory_sources (
+                    memory_id TEXT NOT NULL,
+                    source_event_id TEXT NOT NULL,
+                    evidence_quote TEXT NOT NULL,
+                    link_type TEXT NOT NULL
+                        CHECK (link_type IN ('DERIVED', 'CONFIRMED')),
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    PRIMARY KEY (memory_id, source_event_id),
+                    FOREIGN KEY (memory_id) REFERENCES memories(id)
+                        ON DELETE CASCADE,
+                    FOREIGN KEY (source_event_id) REFERENCES source_events(id)
+                        ON DELETE CASCADE
+                )
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_memory_sources_source
+                ON memory_sources(source_event_id)
+                """
+            )
+            connection.execute(
+                """
+                CREATE INDEX IF NOT EXISTS idx_source_events_observed_at
+                ON source_events(observed_at)
+                """
+            )
 
     @staticmethod
     def _migrate_memory_state(connection: sqlite3.Connection) -> None:
@@ -146,6 +211,36 @@ class SQLiteBackend:
             raise ValueError("content must be a non-empty string")
         return content.strip()
 
+    @staticmethod
+    def _insert_memory_row(
+        connection: sqlite3.Connection,
+        *,
+        memory_id: str,
+        content: str,
+        embedding: list[float] | None,
+    ) -> None:
+        connection.execute(
+            """
+            INSERT INTO memories (id, content)
+            VALUES (?, ?)
+            """,
+            (memory_id, content),
+        )
+        if embedding is not None:
+            connection.execute(
+                """
+                INSERT INTO memory_embeddings (
+                    memory_id, dimensions, embedding
+                )
+                VALUES (?, ?, ?)
+                """,
+                (
+                    memory_id,
+                    len(embedding),
+                    sqlite_vec.serialize_float32(embedding),
+                ),
+            )
+
     def _create_embedding(self, content: str) -> list[float]:
         """Get embedding of a string"""
         if self.embedding_provider is None:
@@ -163,28 +258,12 @@ class SQLiteBackend:
             embedding = self._create_embedding(content)
 
         with self._connect() as connection:
-            connection.execute(
-                """
-                INSERT INTO memories (id, content)
-                VALUES (?, ?)
-                """,
-                (memory_id, content),
+            self._insert_memory_row(
+                connection,
+                memory_id=memory_id,
+                content=content,
+                embedding=embedding,
             )
-            # insert embedding of the memory
-            if embedding is not None:
-                connection.execute(
-                    """
-                    INSERT INTO memory_embeddings (
-                        memory_id, dimensions, embedding
-                    )
-                    VALUES (?, ?, ?)
-                    """,
-                    (
-                        memory_id,
-                        len(embedding),
-                        sqlite_vec.serialize_float32(embedding),
-                    ),
-                )
 
         return memory_id
 
@@ -210,27 +289,12 @@ class SQLiteBackend:
             if existing["state"] != "ACTIVE":
                 raise ValueError("Only an active memory can be superseded")
 
-            connection.execute(
-                """
-                INSERT INTO memories (id, content)
-                VALUES (?, ?)
-                """,
-                (new_memory_id, content),
+            self._insert_memory_row(
+                connection,
+                memory_id=new_memory_id,
+                content=content,
+                embedding=embedding,
             )
-            if embedding is not None:
-                connection.execute(
-                    """
-                    INSERT INTO memory_embeddings (
-                        memory_id, dimensions, embedding
-                    )
-                    VALUES (?, ?, ?)
-                    """,
-                    (
-                        new_memory_id,
-                        len(embedding),
-                        sqlite_vec.serialize_float32(embedding),
-                    ),
-                )
 
             # insertion finished.Then lets make the old one outdated
             cursor = connection.execute(
@@ -248,7 +312,145 @@ class SQLiteBackend:
 
         return new_memory_id
 
-    def remember(self, extracted: ExtractedResult) -> str:
+    def apply_decisions(
+        self,
+        source_event: SourceEvent,
+        changes: Sequence[tuple[MemoryDecision, str]],
+    ) -> list[MemoryDecision]:
+        """Atomically persist one source event and all memory decisions it caused."""
+        if not changes:
+            return []
+
+        metadata_json = json.dumps(
+            source_event.metadata,
+            ensure_ascii=False,
+            sort_keys=True,
+        )
+        prepared: list[tuple[MemoryDecision, str, str, list[float] | None]] = []
+        for decision, evidence_quote in changes:
+            embedding: list[float] | None = None
+            if decision.action in {"ADD", "SUPERSEDE"}:
+                memory_id = str(uuid.uuid4())
+                if self.embedding_provider is not None:
+                    embedding = self._create_embedding(decision.fact)
+            else:
+                memory_id = cast(str, decision.matched_memory_id)
+            prepared.append((decision, evidence_quote, memory_id, embedding))
+
+        completed: list[MemoryDecision] = []
+        # add source events
+        with self._connect() as connection:
+            connection.execute("BEGIN IMMEDIATE")
+            connection.execute(
+                """
+                INSERT INTO source_events (
+                    id,
+                    content,
+                    source_type,
+                    role,
+                    observed_at,
+                    metadata_json
+                )
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    source_event.id,
+                    source_event.content,
+                    source_event.source_type,
+                    source_event.role,
+                    source_event.observed_at,
+                    metadata_json,
+                ),
+            )
+
+            # handle decision
+            for decision, evidence_quote, memory_id, embedding in prepared:
+                link_type: SourceLinkType
+                if decision.action == "ADD":
+                    self._insert_memory_row(
+                        connection,
+                        memory_id=memory_id,
+                        content=decision.fact,
+                        embedding=embedding,
+                    )
+                    completed_decision = replace(
+                        decision,
+                        memory_id=memory_id,
+                    )
+                    link_type = "DERIVED"
+                elif decision.action == "NOOP":
+                    matched = connection.execute(
+                        "SELECT state FROM memories WHERE id = ?",
+                        (memory_id,),
+                    ).fetchone()
+                    # NOOP is a repetion of the existing memory
+                    if matched is None or matched["state"] != "ACTIVE":
+                        raise RuntimeError("NOOP target changed after reconciliation")
+                    completed_decision = replace(
+                        decision,
+                        memory_id=memory_id,
+                    )
+                    link_type = "CONFIRMED"
+                elif decision.action == "SUPERSEDE":
+                    self._insert_memory_row(
+                        connection,
+                        memory_id=memory_id,
+                        content=decision.fact,
+                        embedding=embedding,
+                    )
+                    cursor = connection.execute(
+                        """
+                        UPDATE memories
+                        SET state = 'SUPERSEDED',
+                            superseded_by_id = ?,
+                            superseded_at = CURRENT_TIMESTAMP
+                        WHERE id = ? AND state = 'ACTIVE'
+                        """,
+                        (memory_id, decision.matched_memory_id),
+                    )
+                    if cursor.rowcount != 1:
+                        raise RuntimeError(
+                            "SUPERSEDE target changed after reconciliation"
+                        )
+                    completed_decision = replace(
+                        decision,
+                        memory_id=memory_id,
+                    )
+                    link_type = "DERIVED"
+                else:
+                    raise ValueError(f"Unsupported memory action: {decision.action}")
+
+                # add memory to event link
+                connection.execute(
+                    """
+                    INSERT INTO memory_sources (
+                        memory_id,
+                        source_event_id,
+                        evidence_quote,
+                        link_type
+                    )
+                    VALUES (?, ?, ?, ?)
+                    """,
+                    (
+                        memory_id,
+                        source_event.id,
+                        evidence_quote,
+                        link_type,
+                    ),
+                )
+                completed.append(completed_decision)
+
+        return completed
+
+    def remember(
+        self,
+        extracted: ExtractedResult,
+        source_event: SourceEvent | None = None,
+    ) -> str:
+        if source_event is not None:
+            raise TypeError(
+                "SQLiteBackend cannot reconcile sourced extracted results directly"
+            )
         return self.insert(extracted.content)
 
     def get(self, memory_id: str) -> MemoryRecord | None:
@@ -273,6 +475,55 @@ class SQLiteBackend:
 
         return self._memory_from_row(row)
 
+    def get_sources(self, memory_id: str) -> list[MemorySourceRecord]:
+        if not isinstance(memory_id, str) or not memory_id.strip():
+            raise ValueError("memory_id must be a non-empty string")
+
+        with self._connect() as connection:
+            rows = connection.execute(
+                """
+                SELECT
+                    s.id,
+                    s.content,
+                    s.source_type,
+                    s.role,
+                    s.observed_at,
+                    s.created_at AS source_created_at,
+                    s.metadata_json,
+                    ms.evidence_quote,
+                    ms.link_type,
+                    ms.created_at AS linked_at
+                FROM memory_sources AS ms
+                JOIN source_events AS s ON s.id = ms.source_event_id
+                WHERE ms.memory_id = ?
+                ORDER BY s.observed_at ASC, s.created_at ASC
+                """,
+                (memory_id,),
+            ).fetchall()
+
+        records: list[MemorySourceRecord] = []
+        for row in rows:
+            metadata = json.loads(row["metadata_json"])
+            if not isinstance(metadata, dict):
+                raise RuntimeError("Stored source metadata must be a JSON object")
+            records.append(
+                MemorySourceRecord(
+                    source=SourceEventRecord(
+                        id=row["id"],
+                        content=row["content"],
+                        source_type=cast(SourceType, row["source_type"]),
+                        role=cast(SourceRole | None, row["role"]),
+                        observed_at=row["observed_at"],
+                        created_at=row["source_created_at"],
+                        metadata=metadata,
+                    ),
+                    evidence_quote=row["evidence_quote"],
+                    link_type=cast(SourceLinkType, row["link_type"]),
+                    linked_at=row["linked_at"],
+                )
+            )
+        return records
+
     def remove(self, memory_id: str) -> bool:
         """Remove a memory and its embedding, returning whether it existed."""
         if not isinstance(memory_id, str) or not memory_id.strip():
@@ -280,10 +531,33 @@ class SQLiteBackend:
 
         # embedding uses foreign key,We don't need to delete again
         with self._connect() as connection:
+            source_rows = connection.execute(
+                """
+                SELECT source_event_id
+                FROM memory_sources
+                WHERE memory_id = ?
+                """,
+                (memory_id,),
+            ).fetchall()
             cursor = connection.execute(
                 "DELETE FROM memories WHERE id = ?",
                 (memory_id,),
             )
+            # remove  memory related evenets
+            if cursor.rowcount > 0:
+                for row in source_rows:
+                    connection.execute(
+                        """
+                        DELETE FROM source_events
+                        WHERE id = ?
+                          AND NOT EXISTS (
+                              SELECT 1
+                              FROM memory_sources
+                              WHERE source_event_id = ?
+                          )
+                        """,
+                        (row["source_event_id"], row["source_event_id"]),
+                    )
 
         return cursor.rowcount > 0
 

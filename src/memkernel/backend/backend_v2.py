@@ -16,6 +16,7 @@ from memkernel.backend.sqlite_adapter import SQLiteBackend
 from memkernel.embedding import EmbeddingProvider
 from memkernel.extractor.extractor import ExtractedResult
 from memkernel.extractor.extractor_v2 import JsonExtractedResult
+from memkernel.provenance import MemorySourceRecord, SourceEvent
 
 logger = logging.getLogger(__name__)
 
@@ -183,25 +184,25 @@ class BackendV2:
 
         raise ValueError(f"Unsupported memory action: {decision.action}")
 
-    def remember(self, extracted: ExtractedResult) -> list[MemoryDecision]:
+    def remember(
+        self,
+        extracted: ExtractedResult,
+        source_event: SourceEvent,
+    ) -> list[MemoryDecision]:
+        """Remeber a extracted fact,with source info recorded"""
         # safety check
         if not isinstance(extracted, JsonExtractedResult):
             raise TypeError("BackendV2 requires a JsonExtractedResult")
         if self.sqlite_backend.embedding_provider is None:
             raise RuntimeError("BackendV2.remember requires an embedding_provider")
 
-        facts = extracted.parsed_dict.get("facts")
+        fact_evidence_pairs = [
+            (fact.content, fact.evidence) for fact in extracted.facts
+        ]
 
-        # check if facts are  ok
-        if not isinstance(facts, list):
-            raise ValueError('Extracted result must contain a "facts" list')
-        if not all(isinstance(fact, str) and fact.strip() for fact in facts):
-            raise ValueError("Every extracted fact must be a non-empty string")
-
-        decisions: list[MemoryDecision] = []
-        for raw_fact in facts:
+        pending_changes: list[tuple[MemoryDecision, str]] = []
+        for fact, evidence_quote in fact_evidence_pairs:
             # decide each fact
-            fact = raw_fact.strip()
             candidates = self.sqlite_backend.search_current(
                 fact,
                 top_k=self.candidate_limit,
@@ -214,10 +215,14 @@ class BackendV2:
             ]
 
             pending_decision = self._decide(fact, candidates)
-            completed_decision = self._apply_decision(pending_decision)
-            decisions.append(completed_decision)
+            pending_changes.append((pending_decision, evidence_quote))
 
-            # DEBUG
+        decisions = self.sqlite_backend.apply_decisions(
+            source_event,
+            pending_changes,
+        )
+
+        for completed_decision in decisions:
             if completed_decision.action == "NOOP":
                 logger.debug(
                     "Skipping equivalent fact; matched memory %s",
@@ -249,3 +254,6 @@ class BackendV2:
 
     def list_memories(self) -> list[MemoryRecord]:
         return self.sqlite_backend.list_memories()
+
+    def get_sources(self, memory_id: str) -> list[MemorySourceRecord]:
+        return self.sqlite_backend.get_sources(memory_id)

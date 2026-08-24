@@ -2,6 +2,7 @@ from dataclasses import dataclass
 from typing import Any, Dict, Literal, Protocol
 
 from memkernel.extractor import ExtractedResult
+from memkernel.provenance import MemorySourceRecord, SourceEvent
 
 
 MemoryState = Literal["ACTIVE", "SUPERSEDED"]
@@ -41,8 +42,11 @@ class MemoryDecision:
 
 
 class Backend(Protocol):
-    # return memory id
-    def remember(self, extracted: ExtractedResult) -> str: ...
+    def remember(
+        self,
+        extracted: ExtractedResult,
+        source_event: SourceEvent,
+    ) -> object: ...
 
     def get(self, memory_id: str) -> MemoryRecord | None: ...
 
@@ -57,3 +61,5 @@ class Backend(Protocol):
     def search_history(self, content: str, top_k: int = 5) -> list[ScoredMemory]: ...
 
     def list_memories(self) -> list[MemoryRecord]: ...
+
+    def get_sources(self, memory_id: str) -> list[MemorySourceRecord]: ...
