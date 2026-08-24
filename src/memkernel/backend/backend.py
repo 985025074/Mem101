@@ -1,5 +1,5 @@
 from dataclasses import dataclass
-from typing import Any, Dict, Protocol
+from typing import Any, Dict, Literal, Protocol
 
 from memkernel.extractor import ExtractedResult
 
@@ -16,6 +16,20 @@ class MemoryRecord:
 class ScoredMemory:
     memory: MemoryRecord
     similarity: float
+
+
+MemoryAction = Literal["ADD", "NOOP", "SUPERSEDE"]
+
+
+@dataclass(frozen=True, slots=True)
+class MemoryDecision:
+    action: MemoryAction
+    fact: str
+    # If already exists,this is the existing id
+    # otherwise new id
+    memory_id: str
+    # for new memory it is none
+    matched_memory_id: str | None = None
 
 
 class Backend(Protocol):

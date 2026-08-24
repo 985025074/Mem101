@@ -1,10 +1,9 @@
 import json
 import logging
 from pathlib import Path
-from typing import List
 
 from memkernel.ai import AIProvider, DeepSeekAI
-from memkernel.backend.backend import MemoryRecord
+from memkernel.backend.backend import MemoryDecision, MemoryRecord
 from memkernel.backend.sqlite_adapter import SQLiteBackend
 from memkernel.embedding import EmbeddingProvider
 from memkernel.extractor.extractor import ExtractedResult
@@ -39,13 +38,32 @@ class BackendV2:
         memory_path: Path | str = "./memkernel.db",
         ai_provider: AIProvider = DeepSeekAI(),
         embedding_provider: EmbeddingProvider | None = None,
+        similarity_threshold: float = 0.7,
+        candidate_limit: int = 2,
     ):
+        # Safety check
+        if isinstance(similarity_threshold, bool) or not isinstance(
+            similarity_threshold, (int, float)
+        ):
+            raise ValueError("similarity_threshold must be a number")
+        if not -1.0 <= similarity_threshold <= 1.0:
+            raise ValueError("similarity_threshold must be between -1 and 1")
+        if (
+            isinstance(candidate_limit, bool)
+            or not isinstance(candidate_limit, int)
+            or candidate_limit <= 0
+        ):
+            raise ValueError("candidate_limit must be a positive integer")
+        #
+
         self.sqlite_backend = SQLiteBackend(
             memory_path,
             embedding_provider=embedding_provider,
         )
         self.llm: AIProvider = ai_provider
         self.client = ai_provider.get_client()
+        self.similarity_threshold = float(similarity_threshold)
+        self.candidate_limit = candidate_limit
 
     def _compare_two_things(self, a: str, b: str) -> bool:
         """Return whether two memory facts have the same semantic meaning."""
@@ -81,46 +99,74 @@ class BackendV2:
 
         return payload["equivalent"]
 
-    def remember(self, extracted: ExtractedResult) -> str:
-        assert isinstance(extracted, JsonExtractedResult), (
-            "This backend is only suitable for v2 extractor "
-        )
-        facts: List[str] = extracted.parsed_dict["facts"]
-        assert isinstance(facts, List), "LLM falied to return a fact list "
-        for fact in facts:
-            # search existing memory
-            existing_project = self.sqlite_backend.search_similar(fact)
-            # TODO: A good score
-            SCORE_GATE = 0.7
-            # filter dissimilarity things
-            existing_project = [
-                i for i in existing_project if i.similarity > SCORE_GATE
-            ]
-            if len(existing_project) > 0:
-                logger.debug(
-                    "Existing memory: %s",
-                    existing_project[0].memory.content,
-                )
-                # Call LLM to do judge. if new memory expresses the same thing or different thing.
-                # TODO: is it proper to compare it with the first one only
-                is_same = self._compare_two_things(
-                    fact, existing_project[0].memory.content
-                )
+    def remember(self, extracted: ExtractedResult) -> list[MemoryDecision]:
+        # safety check
+        if not isinstance(extracted, JsonExtractedResult):
+            raise TypeError("BackendV2 requires a JsonExtractedResult")
+        if self.sqlite_backend.embedding_provider is None:
+            raise RuntimeError("BackendV2.remember requires an embedding_provider")
 
-                if is_same:
-                    # TODO: counters ++
-                    ...
-                else:
-                    # conflict !
-                    logger.debug("New fact conflicts with existing memory")
-                    # TODO: handle it
-            else:
-                # not exists,you can add it safely
-                self.sqlite_backend.insert(fact)
+        facts = extracted.parsed_dict.get("facts")
+
+        # check if facts are  ok
+        if not isinstance(facts, list):
+            raise ValueError('Extracted result must contain a "facts" list')
+        if not all(isinstance(fact, str) and fact.strip() for fact in facts):
+            raise ValueError("Every extracted fact must be a non-empty string")
+
+        decisions: list[MemoryDecision] = []
+        for raw_fact in facts:
+            fact = raw_fact.strip()
+            candidates = self.sqlite_backend.search_similar(
+                fact,
+                top_k=self.candidate_limit,
+            )
+            candidates = [
+                candidate
+                for candidate in candidates
+                if candidate.similarity >= self.similarity_threshold
+            ]
+
+            matched_memory = None
+            # Judge with each one
+            for candidate in candidates:
+                if self._compare_two_things(fact, candidate.memory.content):
+                    matched_memory = candidate.memory
+                    break
+
+            if matched_memory is not None:
+                # Already exists
+                logger.debug(
+                    "Skipping equivalent fact; matched memory %s",
+                    matched_memory.id,
+                )
+                decisions.append(
+                    MemoryDecision(
+                        action="NOOP",
+                        fact=fact,
+                        memory_id=matched_memory.id,
+                        matched_memory_id=matched_memory.id,
+                    )
+                )
+                continue
+
+            memory_id = self.sqlite_backend.insert(fact)
+            decisions.append(
+                MemoryDecision(
+                    action="ADD",
+                    fact=fact,
+                    memory_id=memory_id,
+                )
+            )
+
+        return decisions
 
     # TODO: retrive method
     def get(self, memory_id: str) -> MemoryRecord | None:
-        self.sqlite_backend.get(memory_id)
+        return self.sqlite_backend.get(memory_id)
+
+    def remove(self, memory_id: str) -> bool:
+        return self.sqlite_backend.remove(memory_id)
 
     def list_memories(self) -> list[MemoryRecord]:
         return self.sqlite_backend.list_memories()
