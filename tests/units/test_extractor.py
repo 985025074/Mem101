@@ -61,6 +61,7 @@ def test_extractor_v2_easy():
         ExtractedFact(content="User likes Rust.", evidence="I like Rust"),
     )
     assert json.loads(llm.input_text) == {
+        "recent_context": [],
         "source": {
             "content": "I like Rust",
             "source_type": "message",
@@ -68,6 +69,74 @@ def test_extractor_v2_easy():
             "observed_at": "2026-08-24T12:00:00+00:00",
         }
     }
+
+
+def test_extractor_passes_recent_context_for_reference_resolution() -> None:
+    payload = {
+        "facts": [
+            {
+                "content": "The user decided to use SQLite.",
+                "evidence": "Yes, use it.",
+            }
+        ]
+    }
+    llm = FakeLLM(json.dumps(payload))
+    extractor = LLMExtractorV2(llm)
+    source = SourceEvent(
+        id="source-id",
+        content="Yes, use it.",
+        source_type="message",
+        role="user",
+        observed_at="2026-08-25T12:00:00+00:00",
+        metadata={
+            "recent_context": [
+                {
+                    "role": "assistant",
+                    "content": "Should we use SQLite for the memory backend?",
+                }
+            ]
+        },
+    )
+
+    result = extractor.extract_with_source(source)
+
+    assert result.facts == (
+        ExtractedFact(
+            content="The user decided to use SQLite.",
+            evidence="Yes, use it.",
+        ),
+    )
+    assert json.loads(llm.input_text)["recent_context"] == [
+        {
+            "role": "assistant",
+            "content": "Should we use SQLite for the memory backend?",
+        }
+    ]
+
+
+def test_extractor_limits_recent_context_to_six_messages() -> None:
+    llm = FakeLLM('{"facts": []}')
+    extractor = LLMExtractorV2(llm)
+    source = SourceEvent(
+        id="source-id",
+        content="Yes.",
+        source_type="message",
+        role="user",
+        observed_at="2026-08-25T12:00:00+00:00",
+        metadata={
+            "recent_context": [
+                {"role": "user", "content": f"message {index}"}
+                for index in range(8)
+            ]
+        },
+    )
+
+    extractor.extract_with_source(source)
+
+    assert [
+        message["content"]
+        for message in json.loads(llm.input_text)["recent_context"]
+    ] == [f"message {index}" for index in range(2, 8)]
 
 
 def test_extractor_rejects_evidence_not_found_in_source() -> None:

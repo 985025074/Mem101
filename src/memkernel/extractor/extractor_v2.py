@@ -13,7 +13,12 @@ EXTRACTOR_PROMPT = """
 You are MemKernel's evidence-bound memory extractor. Convert the supplied
 source event into a small set of durable facts that may be useful later.
 
-Extract only information explicitly supported by source.content, including:
+Extract only information asserted or confirmed by source.content. The optional
+recent_context contains earlier messages, ordered oldest to newest. Use it only
+to resolve references, pronouns, ellipsis, confirmations, and corrections in
+source.content. Never extract a fact supported only by recent_context.
+
+Durable information includes:
 - stable preferences, dislikes, and personal details;
 - relationships, roles, skills, and ongoing work;
 - plans, goals, commitments, and decisions;
@@ -23,7 +28,8 @@ Rules:
 1. Write one atomic, self-contained fact per item.
 2. For every fact, copy a non-empty evidence quote exactly as it appears in
    source.content. Never paraphrase the evidence quote.
-3. Resolve pronouns only when the referenced person or object is unambiguous.
+3. Resolve pronouns and references using recent_context only when the referent
+   is unambiguous. Otherwise, omit the fact.
 4. Preserve qualifiers, negations, quantities, and time expressions.
 5. Resolve relative time using source.observed_at, not the current clock.
 6. Do not invent details, implications, explanations, or personality traits.
@@ -39,6 +45,10 @@ Return valid JSON only, using exactly this schema:
 If the source contains nothing worth remembering, return:
 {"facts": []}
 """.strip()
+
+
+MAX_RECENT_CONTEXT_MESSAGES = 6
+RECENT_CONTEXT_ROLES = {"user", "assistant", "system", "tool"}
 
 
 class ExtractionValidationError(ValueError):
@@ -112,6 +122,35 @@ def parse_extracted_facts(
     return tuple(facts)
 
 
+def parse_recent_context(metadata: dict[str, Any]) -> list[dict[str, str]]:
+    """Validate and bound context supplied for reference resolution."""
+    raw_context = metadata.get("recent_context", [])
+    if not isinstance(raw_context, list):
+        raise ExtractionValidationError(
+            "source metadata recent_context must be a list"
+        )
+
+    recent_context: list[dict[str, str]] = []
+    for message in raw_context[-MAX_RECENT_CONTEXT_MESSAGES:]:
+        if not isinstance(message, dict) or set(message) != {"role", "content"}:
+            raise ExtractionValidationError(
+                "Every recent_context message must contain only role and content"
+            )
+        role = message["role"]
+        content = message["content"]
+        if role not in RECENT_CONTEXT_ROLES:
+            raise ExtractionValidationError(
+                "recent_context contains an unsupported role"
+            )
+        if not isinstance(content, str) or not content.strip():
+            raise ExtractionValidationError(
+                "recent_context content must be a non-empty string"
+            )
+        recent_context.append({"role": role, "content": content.strip()})
+
+    return recent_context
+
+
 class LLMExtractorV2:
     def __init__(self, llm: AIProvider = DeepSeekAI()):
         self.llm: AIProvider = llm
@@ -132,6 +171,7 @@ class LLMExtractorV2:
 
     def extract_with_source(self, source: SourceEvent) -> JsonExtractedResult:
         input_payload = {
+            "recent_context": parse_recent_context(source.metadata),
             "source": {
                 "content": source.content,
                 "source_type": source.source_type,

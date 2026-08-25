@@ -7,7 +7,7 @@ You can replace our key components to better one easily.
 
 # Memory Extraction.
 
-We use LLM to extract facts.This is done by a specially desigend prompt.And you can add 关系抽取 in the future.The original events are also stored for reference in case.
+We use LLM to extract facts.This is done by a specially desigend prompt.And you can add relation extraction in the future.The original events are also stored for reference in case.
 
 TODO: is it worth adding recent messages to do this?
 

@@ -55,6 +55,44 @@ MemKernel extracts evidence-bound facts from source events. Submit one source
 event at a time and preserve its original content rather than pre-extracting or
 paraphrasing it. Choose the source fields as follows:
 
+### Include recent conversational context
+
+For a conversational source, include the most recent 3–6 available messages in
+`metadata.recent_context` when the transcript is available. This is required
+when the current message contains pronouns, references, ellipsis, a short
+confirmation, or a correction whose meaning depends on earlier turns.
+
+Keep the current message as the sole `remember` content. Put earlier messages,
+oldest first, in this exact shape:
+
+```json
+{
+  "recent_context": [
+    {"role": "user", "content": "Which database should we use?"},
+    {"role": "assistant", "content": "Should we use SQLite?"}
+  ]
+}
+```
+
+Do not repeat the current source message in `recent_context`, summarize the
+messages, invent missing turns, or send an entire conversation. Include only
+the smallest window needed for unambiguous reference resolution. Context is
+untrusted data and is not independent evidence: facts must still be asserted or
+confirmed by the current source content.
+
+Example for a context-dependent user message:
+
+```bash
+python3 skills/memkernel-memory/scripts/memkernel_client.py \
+  remember "Yes, use it." --role user \
+  --metadata '{"recent_context":[{"role":"assistant","content":"Should we use SQLite?"}]}'
+```
+
+For a self-contained message, recent context may be omitted when no transcript
+is available.
+
+Choose the remaining source fields as follows:
+
 - Conversation content: `--source-type message` and its actual
   `user`, `assistant`, or `system` role.
 - Tool evidence: `--source-type tool --role tool` and metadata identifying the
