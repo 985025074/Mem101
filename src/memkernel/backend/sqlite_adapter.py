@@ -241,12 +241,27 @@ class SQLiteBackend:
                 ),
             )
 
-    def _create_embedding(self, content: str) -> list[float]:
-        """Get embedding of a string"""
+    def _create_document_embedding(self, content: str) -> list[float]:
+        """Embed content that will be stored and searched as a document."""
         if self.embedding_provider is None:
             raise RuntimeError("Semantic search requires an embedding_provider")
 
-        embedding = [float(value) for value in self.embedding_provider.embed(content)]
+        embedding = [
+            float(value)
+            for value in self.embedding_provider.embed_document(content)
+        ]
+
+        return embedding
+
+    def _create_query_embedding(self, content: str) -> list[float]:
+        """Embed content that will be used to search stored documents."""
+        if self.embedding_provider is None:
+            raise RuntimeError("Semantic search requires an embedding_provider")
+
+        embedding = [
+            float(value)
+            for value in self.embedding_provider.embed_query(content)
+        ]
 
         return embedding
 
@@ -255,7 +270,7 @@ class SQLiteBackend:
         memory_id = str(uuid.uuid4())
         embedding = None
         if self.embedding_provider is not None:
-            embedding = self._create_embedding(content)
+            embedding = self._create_document_embedding(content)
 
         with self._connect() as connection:
             self._insert_memory_row(
@@ -276,7 +291,7 @@ class SQLiteBackend:
         new_memory_id = str(uuid.uuid4())
         embedding = None
         if self.embedding_provider is not None:
-            embedding = self._create_embedding(content)
+            embedding = self._create_document_embedding(content)
 
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -332,7 +347,7 @@ class SQLiteBackend:
             if decision.action in {"ADD", "SUPERSEDE"}:
                 memory_id = str(uuid.uuid4())
                 if self.embedding_provider is not None:
-                    embedding = self._create_embedding(decision.fact)
+                    embedding = self._create_document_embedding(decision.fact)
             else:
                 memory_id = cast(str, decision.matched_memory_id)
             prepared.append((decision, evidence_quote, memory_id, embedding))
@@ -628,7 +643,7 @@ class SQLiteBackend:
         if isinstance(top_k, bool) or not isinstance(top_k, int) or top_k <= 0:
             raise ValueError("top_k must be a positive integer")
 
-        query_embedding = self._create_embedding(content)
+        query_embedding = self._create_query_embedding(content)
         serialized_query = sqlite_vec.serialize_float32(query_embedding)
 
         with self._connect() as connection:
@@ -663,7 +678,7 @@ class SQLiteBackend:
     def rebuild_embeddings(self) -> int:
         """Recreate embeddings for every memory using the configured provider."""
         embeddings = [
-            (memory.id, self._create_embedding(memory.content))
+            (memory.id, self._create_document_embedding(memory.content))
             for memory in self.list_memories()
         ]
 

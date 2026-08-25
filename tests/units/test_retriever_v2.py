@@ -31,11 +31,6 @@ class FakeSemanticBackend:
         return self.historical_matches
 
 
-class StaticEmbeddingProvider:
-    def embed(self, text: str) -> list[float]:
-        return [1.0, 0.0]
-
-
 class UnusedAI:
     def get_client(self) -> object:
         return object()

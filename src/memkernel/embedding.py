@@ -7,10 +7,15 @@ from openai import OpenAI
 
 
 class EmbeddingProvider(Protocol):
-    def embed(self, text: str) -> Sequence[float]: ...
+    def embed_document(self, text: str) -> Sequence[float]: ...
+
+    def embed_query(self, text: str) -> Sequence[float]: ...
 
 
 class OpenAIEmbeddingProvider:
+    DOCUMENT_PREFIX = "search_document: "
+    QUERY_PREFIX = "search_query: "
+
     @staticmethod
     def get_client():
         load_dotenv()
@@ -24,6 +29,12 @@ class OpenAIEmbeddingProvider:
         self.client = client
         self.model = model
 
-    def embed(self, text: str) -> list[float]:
+    def _embed(self, text: str) -> list[float]:
         response = self.client.embeddings.create(model=self.model, input=text)
         return response.data[0].embedding
+
+    def embed_document(self, text: str) -> list[float]:
+        return self._embed(f"{self.DOCUMENT_PREFIX}{text}")
+
+    def embed_query(self, text: str) -> list[float]:
+        return self._embed(f"{self.QUERY_PREFIX}{text}")

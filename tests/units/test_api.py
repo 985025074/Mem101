@@ -132,7 +132,10 @@ class InvalidExtractionKernel(FakeKernel):
 
 
 class StaticEmbeddingProvider:
-    def embed(self, text: str) -> list[float]:
+    def embed_document(self, text: str) -> list[float]:
+        return [1.0, 0.0]
+
+    def embed_query(self, text: str) -> list[float]:
         return [1.0, 0.0]
 
 

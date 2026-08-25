@@ -10,14 +10,34 @@ from memkernel.provenance import SourceEvent
 
 
 class StaticEmbeddingProvider:
-    def embed(self, text: str) -> list[float]:
+    def embed_document(self, text: str) -> list[float]:
+        return [1.0, 0.0]
+
+    def embed_query(self, text: str) -> list[float]:
         return [1.0, 0.0]
 
 
 class FailingNewMemoryEmbeddingProvider:
-    def embed(self, text: str) -> list[float]:
+    def embed_document(self, text: str) -> list[float]:
         if text == "New memory.":
             return []
+        return [1.0, 0.0]
+
+    def embed_query(self, text: str) -> list[float]:
+        return [1.0, 0.0]
+
+
+class RecordingEmbeddingProvider:
+    def __init__(self):
+        self.documents: list[str] = []
+        self.queries: list[str] = []
+
+    def embed_document(self, text: str) -> list[float]:
+        self.documents.append(text)
+        return [1.0, 0.0]
+
+    def embed_query(self, text: str) -> list[float]:
+        self.queries.append(text)
         return [1.0, 0.0]
 
 
@@ -106,6 +126,24 @@ def test_remove_also_removes_embedding(tmp_path) -> None:
 
     assert backend.remove(memory_id) is True
     assert backend.search_similar("Rust preference") == []
+
+
+def test_storage_and_search_use_different_embedding_tasks(tmp_path) -> None:
+    embedding_provider = RecordingEmbeddingProvider()
+    backend = SQLiteBackend(
+        tmp_path / "embedding-tasks.db",
+        embedding_provider=embedding_provider,
+    )
+
+    backend.insert("Jenny likes apples.")
+    backend.search_current("Who likes apples?")
+
+    assert embedding_provider.documents == ["Jenny likes apples."]
+    assert embedding_provider.queries == ["Who likes apples?"]
+
+    embedding_provider.documents.clear()
+    backend.rebuild_embeddings()
+    assert embedding_provider.documents == ["Jenny likes apples."]
 
 
 def test_shared_source_lives_until_its_last_memory_is_removed(tmp_path) -> None:
