@@ -13,7 +13,7 @@ class AIProvider(Protocol):
 
 class DeepSeekAI:
     model = "deepseek-v4-flash"
-    effort: ReasoningEffort = "max"
+    effort: ReasoningEffort = "low"
 
     @staticmethod
     def get_client():
