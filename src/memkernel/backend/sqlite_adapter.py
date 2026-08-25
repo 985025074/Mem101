@@ -659,6 +659,7 @@ class SQLiteBackend:
             for row in rows
         ]
 
+    # This is for migration of old datebases,which doesn't have embeddings
     def rebuild_embeddings(self) -> int:
         """Recreate embeddings for every memory using the configured provider."""
         embeddings = [

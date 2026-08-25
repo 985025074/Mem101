@@ -1,4 +1,5 @@
 import json
+import logging
 
 from fastapi.testclient import TestClient
 
@@ -82,11 +83,13 @@ class FakeKernel:
         histories: dict[str, list[MemoryRecord]] | None = None,
         decisions: list[MemoryDecision] | None = None,
         sources: dict[str, list[MemorySourceRecord]] | None = None,
+        memories: list[MemoryRecord] | None = None,
     ):
         self.results = results
         self.histories = histories or {}
         self.decisions = decisions or []
         self.sources = sources or {}
+        self.memories = memories or []
         self.calls: list[tuple[str, int, int, float]] = []
         self.remember_calls: list[PostMemory] = []
 
@@ -106,6 +109,9 @@ class FakeKernel:
 
     def get_sources(self, memory_id: str) -> list[MemorySourceRecord] | None:
         return self.sources.get(memory_id)
+
+    def list_memories(self) -> list[MemoryRecord]:
+        return self.memories
 
     def remember(self, content: PostMemory) -> list[MemoryDecision]:
         self.remember_calls.append(content)
@@ -189,6 +195,86 @@ def test_recall_uses_current_only_defaults() -> None:
         ],
         "history": [],
     }
+
+
+def test_debug_memories_displays_memory_and_provenance_table() -> None:
+    stored_memory = memory(
+        "memory-id",
+        "User prefers <script>alert('xss')</script> Rust.",
+    )
+    kernel = FakeKernel(
+        RecallResults(current=[], history=[]),
+        sources={"memory-id": [memory_source()]},
+        memories=[stored_memory],
+    )
+    client = TestClient(create_app(kernel=kernel))
+
+    response = client.get("/debug/memories")
+
+    assert response.status_code == 200
+    assert response.headers["content-type"].startswith("text/html")
+    assert response.headers["cache-control"] == "no-store"
+    assert "MemKernel memories" in response.text
+    assert "memory-id" in response.text
+    assert "I like Rust" in response.text
+    assert "&lt;script&gt;alert(&#x27;xss&#x27;)&lt;/script&gt;" in response.text
+    assert "<script>alert('xss')</script>" not in response.text
+
+
+def test_debug_memories_displays_empty_state() -> None:
+    kernel = FakeKernel(RecallResults(current=[], history=[]))
+    client = TestClient(create_app(kernel=kernel))
+
+    response = client.get("/debug/memories")
+
+    assert response.status_code == 200
+    assert "No memories stored." in response.text
+
+
+def test_every_api_handler_emits_a_debug_log(caplog) -> None:
+    stored_memory = memory("memory-id", "User likes Rust.")
+    kernel = FakeKernel(
+        RecallResults(current=[], history=[]),
+        histories={"memory-id": [stored_memory]},
+        sources={"memory-id": [memory_source()]},
+        memories=[stored_memory],
+    )
+    client = TestClient(create_app(kernel=kernel))
+
+    with caplog.at_level(logging.DEBUG, logger="memkernel.api"):
+        assert client.get("/").status_code == 200
+        assert client.get("/debug/memories").status_code == 200
+        recall_response = client.post("/v1/recall", json={"query": "Rust"})
+        assert recall_response.status_code == 200
+        assert client.post(
+            "/v1/memories",
+            json={
+                "content": "private source content",
+                "metadata": {"token": "private metadata value"},
+            },
+        ).status_code == 200
+        assert client.get("/v1/memories/memory-id/history").status_code == 200
+        assert client.get("/v1/memories/memory-id/sources").status_code == 200
+
+    messages = [
+        record.getMessage()
+        for record in caplog.records
+        if record.name == "memkernel.api"
+    ]
+    assert any(message.startswith("GET /") for message in messages)
+    assert any(message.startswith("GET /debug/memories") for message in messages)
+    assert any(message.startswith("POST /v1/recall") for message in messages)
+    assert any(message.startswith("POST /v1/memories") for message in messages)
+    assert any(
+        message.startswith("GET /v1/memories/{memory_id}/history")
+        for message in messages
+    )
+    assert any(
+        message.startswith("GET /v1/memories/{memory_id}/sources")
+        for message in messages
+    )
+    assert "private source content" not in "\n".join(messages)
+    assert "private metadata value" not in "\n".join(messages)
 
 
 def test_recall_exposes_independent_history_parameters() -> None:

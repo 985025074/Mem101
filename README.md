@@ -28,8 +28,12 @@ agents such as Codex and Pi can discover it.
 Start the configured API application:
 
 ```bash
+uv run python scripts/initialize_database.py
 uv run fastapi dev src/memkernel/api.py
 ```
+
+The initialization command creates or migrates `memkernel.db` and rebuilds
+embeddings for all existing memories. Use `--database PATH` for another file.
 
 Preview where the skill would be installed:
 

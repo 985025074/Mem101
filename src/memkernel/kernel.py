@@ -154,6 +154,10 @@ class MemKernel:
 
         return history
 
+    def list_memories(self) -> list[MemoryRecord]:
+        """Return all memories for administrative and debugging views."""
+        return self.memory_backend.list_memories()
+
     def get_sources(self, memory_id: str) -> list[MemorySourceRecord] | None:
         if self.memory_backend.get(memory_id) is None:
             return None
