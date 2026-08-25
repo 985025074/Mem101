@@ -26,6 +26,11 @@ The system is intentionally modular: the extraction model, embedding model,
 retrieval strategy, reconciliation logic, and storage backend can be replaced
 independently.
 
+## Paper
+
+For a concise description of the architecture and preliminary LoCoMo results,
+see [MemKernel: A Simple and Extensible Memory Service for Language Agents](paper/memkernel_acl_short_paper.pdf).
+
 ## How it works
 
 1. **Ingest:** MemKernel receives a message, tool result, or document.
