@@ -19,7 +19,34 @@ After normal distance comparision,an LLM conducted comparision is also added to 
 # Retrive
 
 
-# how to wire this to you Agent 
+# Quick start/how to wire this to you Agent 
+
+The canonical agent skill is stored in `skills/memkernel-memory`. The setup
+script installs it globally in `~/.agents/skills`, where Agent Skills-compatible
+agents such as Codex and Pi can discover it.
+
+Start the configured API application:
+
+```bash
+uv run fastapi dev src/memkernel/api.py
+```
+
+Preview where the skill would be installed:
+
+```bash
+python3 scripts/setup_agent_skill.py --dry-run
+```
+
+Install it globally:
+
+```bash
+python3 scripts/setup_agent_skill.py
+```
+
+Set `MEMKERNEL_URL` when the server does not use the default
+`http://127.0.0.1:8000`, then restart or reload the agent.
+
+
 
 
 # TODO

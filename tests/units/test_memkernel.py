@@ -9,7 +9,7 @@ class RecordingExtractor:
     def __init__(self):
         self.inputs: list[str] = []
 
-    def extract_source(self, source: SourceEvent) -> SimpleExtractedResult:
+    def extract_with_source(self, source: SourceEvent) -> SimpleExtractedResult:
         self.inputs.append(source.content)
         return SimpleExtractedResult(source.content)
 

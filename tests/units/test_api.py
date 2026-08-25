@@ -141,12 +141,12 @@ class UnusedAI:
 
 
 class UnusedExtractor:
-    def extract(self, given_info: str):
+    def extract_with_source(self, source: SourceEvent):
         raise AssertionError("Recall must not call the extractor")
 
 
 class StaticExtractor:
-    def extract_source(self, source: SourceEvent) -> JsonExtractedResult:
+    def extract_with_source(self, source: SourceEvent) -> JsonExtractedResult:
         payload = {
             "facts": [
                 {
