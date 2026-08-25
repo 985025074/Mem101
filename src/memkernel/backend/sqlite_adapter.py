@@ -247,8 +247,7 @@ class SQLiteBackend:
             raise RuntimeError("Semantic search requires an embedding_provider")
 
         embedding = [
-            float(value)
-            for value in self.embedding_provider.embed_document(content)
+            float(value) for value in self.embedding_provider.embed_document(content)
         ]
 
         return embedding
@@ -259,8 +258,7 @@ class SQLiteBackend:
             raise RuntimeError("Semantic search requires an embedding_provider")
 
         embedding = [
-            float(value)
-            for value in self.embedding_provider.embed_query(content)
+            float(value) for value in self.embedding_provider.embed_query(content)
         ]
 
         return embedding
@@ -353,6 +351,8 @@ class SQLiteBackend:
             prepared.append((decision, evidence_quote, memory_id, embedding))
 
         completed: list[MemoryDecision] = []
+        # recording the supersede in the batch
+        latest_batch_replacement: dict[str, str] = {}
         # add source events
         with self._connect() as connection:
             connection.execute("BEGIN IMMEDIATE")
@@ -381,6 +381,7 @@ class SQLiteBackend:
             # handle decision
             for decision, evidence_quote, memory_id, embedding in prepared:
                 link_type: SourceLinkType
+                linked_memory_id = memory_id
                 if decision.action == "ADD":
                     self._insert_memory_row(
                         connection,
@@ -394,19 +395,35 @@ class SQLiteBackend:
                     )
                     link_type = "DERIVED"
                 elif decision.action == "NOOP":
+                    # confined the new memory's id if possible
+                    confirmed_memory_id = latest_batch_replacement.get(
+                        memory_id,
+                        memory_id,
+                    )
                     matched = connection.execute(
                         "SELECT state FROM memories WHERE id = ?",
-                        (memory_id,),
+                        (confirmed_memory_id,),
                     ).fetchone()
                     # NOOP is a repetion of the existing memory
                     if matched is None or matched["state"] != "ACTIVE":
                         raise RuntimeError("NOOP target changed after reconciliation")
                     completed_decision = replace(
                         decision,
-                        memory_id=memory_id,
+                        memory_id=confirmed_memory_id,
+                        matched_memory_id=confirmed_memory_id,
                     )
+                    linked_memory_id = confirmed_memory_id
                     link_type = "CONFIRMED"
                 elif decision.action == "SUPERSEDE":
+                    # TODO: This logic may be not  right.
+                    # the request_id we want (for example we want outdate A),it may be outdated by the previous decision
+                    # we can get that by latest batch replacement dict
+                    # and the newest supersede should outdate that!
+                    requested_target_id = cast(str, decision.matched_memory_id)
+                    actual_target_id = latest_batch_replacement.get(
+                        requested_target_id,
+                        requested_target_id,
+                    )
                     self._insert_memory_row(
                         connection,
                         memory_id=memory_id,
@@ -421,7 +438,7 @@ class SQLiteBackend:
                             superseded_at = CURRENT_TIMESTAMP
                         WHERE id = ? AND state = 'ACTIVE'
                         """,
-                        (memory_id, decision.matched_memory_id),
+                        (memory_id, actual_target_id),
                     )
                     if cursor.rowcount != 1:
                         raise RuntimeError(
@@ -430,7 +447,10 @@ class SQLiteBackend:
                     completed_decision = replace(
                         decision,
                         memory_id=memory_id,
+                        matched_memory_id=actual_target_id,
                     )
+                    latest_batch_replacement[requested_target_id] = memory_id
+                    latest_batch_replacement[actual_target_id] = memory_id
                     link_type = "DERIVED"
                 else:
                     raise ValueError(f"Unsupported memory action: {decision.action}")
@@ -445,9 +465,10 @@ class SQLiteBackend:
                         link_type
                     )
                     VALUES (?, ?, ?, ?)
+                    ON CONFLICT (memory_id, source_event_id) DO NOTHING
                     """,
                     (
-                        memory_id,
+                        linked_memory_id,
                         source_event.id,
                         evidence_quote,
                         link_type,
