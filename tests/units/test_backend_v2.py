@@ -6,6 +6,7 @@ import pytest
 
 from memkernel.backend.backend import MemoryDecision, ScoredMemory
 from memkernel.backend.backend_v2 import (
+    BATCH_RECONCILE_PROMPT,
     BackendV2,
     RECONCILE_PROMPT,
 )
@@ -33,6 +34,21 @@ class RecordingAI:
         self.call_count += 1
         self.instruction = inst
         self.input_text = input_text
+        input_payload = json.loads(input_text)
+        if "comparisons" in input_payload:
+            response_payload = json.loads(self.response)
+            relation = response_payload["relation"]
+            return json.dumps(
+                {
+                    "comparisons": [
+                        {
+                            "comparison_id": comparison["comparison_id"],
+                            "relation": relation,
+                        }
+                        for comparison in input_payload["comparisons"]
+                    ]
+                }
+            )
         return self.response
 
 
@@ -64,7 +80,24 @@ class CandidateAwareAI(RecordingAI):
         self, client: object, inst: str, input_text: str
     ) -> str:
         self.call_count += 1
+        self.instruction = inst
+        self.input_text = input_text
         payload = json.loads(input_text)
+        if "comparisons" in payload:
+            return json.dumps(
+                {
+                    "comparisons": [
+                        {
+                            "comparison_id": comparison["comparison_id"],
+                            "relation": "EQUIVALENT"
+                            if comparison["existing_fact"]
+                            == self.equivalent_content
+                            else "DISTINCT",
+                        }
+                        for comparison in payload["comparisons"]
+                    ]
+                }
+            )
         relation = (
             "EQUIVALENT"
             if payload["existing_fact"] == self.equivalent_content
@@ -348,7 +381,7 @@ def test_sourced_supersede_keeps_old_and_new_evidence_separate(tmp_path) -> None
     ] == ["new-source"]
 
 
-def test_sourced_batch_rolls_back_if_a_target_changes(tmp_path) -> None:
+def test_sourced_batch_chains_repeated_supersessions(tmp_path) -> None:
     database_path = tmp_path / "memory.db"
     backend = BackendV2(
         database_path,
@@ -362,25 +395,37 @@ def test_sourced_batch_rolls_back_if_a_target_changes(tmp_path) -> None:
         "I moved to Beijing and then to Shenzhen",
     )
 
-    with pytest.raises(RuntimeError, match="target changed"):
-        backend.remember(
-            sourced_result(
-                ("User lives in Beijing.", "moved to Beijing"),
-                ("User lives in Shenzhen.", "then to Shenzhen"),
-            ),
-            source_event=source,
-        )
+    decisions = backend.remember(
+        sourced_result(
+            ("User lives in Beijing.", "moved to Beijing"),
+            ("User lives in Shenzhen.", "then to Shenzhen"),
+        ),
+        source_event=source,
+    )
 
     old_memory = backend.get(old_id)
     assert old_memory is not None
-    assert old_memory.state == "ACTIVE"
-    assert backend.list_memories() == [old_memory]
+    beijing_id = decisions[0].memory_id
+    shenzhen_id = decisions[1].memory_id
+    assert beijing_id is not None
+    assert shenzhen_id is not None
+    beijing_memory = backend.get(beijing_id)
+    shenzhen_memory = backend.get(shenzhen_id)
+
+    assert old_memory.state == "SUPERSEDED"
+    assert old_memory.superseded_by_id == beijing_id
+    assert beijing_memory is not None
+    assert beijing_memory.state == "SUPERSEDED"
+    assert beijing_memory.superseded_by_id == shenzhen_id
+    assert shenzhen_memory is not None
+    assert shenzhen_memory.state == "ACTIVE"
+    assert decisions[1].matched_memory_id == beijing_id
     connection = sqlite3.connect(database_path)
     source_count = connection.execute(
         "SELECT COUNT(*) FROM source_events"
     ).fetchone()[0]
     connection.close()
-    assert source_count == 0
+    assert source_count == 1
 
 
 def test_reconciliation_compares_only_with_current_memories(tmp_path) -> None:
@@ -402,7 +447,10 @@ def test_reconciliation_compares_only_with_current_memories(tmp_path) -> None:
     assert decisions[0].action == "SUPERSEDE"
     assert decisions[0].matched_memory_id == current_id
     assert ai.call_count == 1
-    assert json.loads(ai.input_text)["existing_fact"] == "User lives in Beijing."
+    assert ai.instruction == BATCH_RECONCILE_PROMPT
+    assert json.loads(ai.input_text)["comparisons"][0]["existing_fact"] == (
+        "User lives in Beijing."
+    )
 
 
 def test_remember_adds_distinct_but_similar_fact(tmp_path) -> None:
@@ -441,8 +489,33 @@ def test_remember_checks_more_than_the_first_candidate(tmp_path) -> None:
 
     assert decisions[0].action == "NOOP"
     assert decisions[0].matched_memory_id == equivalent_id
-    assert ai.call_count == 2
+    assert ai.call_count == 1
     assert len(backend.list_memories()) == 2
+
+
+def test_remember_batches_multiple_fact_comparisons_into_one_llm_call(
+    tmp_path,
+) -> None:
+    ai = RecordingAI('{"relation": "DISTINCT"}')
+    backend = BackendV2(
+        tmp_path / "memory.db",
+        ai_provider=ai,
+        embedding_provider=StaticEmbeddingProvider(),
+        candidate_limit=1,
+    )
+    backend.sqlite_backend.insert("User likes Python.")
+
+    decisions = remember_facts(
+        backend,
+        "User likes Rust.",
+        "User likes green tea.",
+    )
+
+    assert [decision.action for decision in decisions] == ["ADD", "ADD"]
+    assert ai.call_count == 1
+    assert ai.instruction == BATCH_RECONCILE_PROMPT
+    payload = json.loads(ai.input_text)
+    assert len(payload["comparisons"]) == 2
 
 
 def test_remember_handles_multiple_facts(tmp_path) -> None:

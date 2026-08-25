@@ -178,6 +178,80 @@ def test_shared_source_lives_until_its_last_memory_is_removed(tmp_path) -> None:
     assert source_count == 0
 
 
+def test_same_source_can_confirm_one_memory_more_than_once(tmp_path) -> None:
+    backend = SQLiteBackend(
+        tmp_path / "duplicate-confirmation.db",
+        embedding_provider=StaticEmbeddingProvider(),
+    )
+    memory_id = backend.insert("Caroline wants to adopt children.")
+
+    completed = backend.apply_decisions(
+        source_event(
+            "source-with-repeated-facts",
+            "Caroline wants to adopt children and give children a loving home.",
+        ),
+        [
+            (
+                MemoryDecision(
+                    action="NOOP",
+                    fact="Caroline wants to adopt children.",
+                    matched_memory_id=memory_id,
+                ),
+                "wants to adopt children",
+            ),
+            (
+                MemoryDecision(
+                    action="NOOP",
+                    fact="Caroline wants to give children a loving home.",
+                    matched_memory_id=memory_id,
+                ),
+                "give children a loving home",
+            ),
+        ],
+    )
+
+    assert len(completed) == 2
+    assert [decision.memory_id for decision in completed] == [memory_id, memory_id]
+    sources = backend.get_sources(memory_id)
+    assert len(sources) == 1
+    assert sources[0].source.id == "source-with-repeated-facts"
+    assert sources[0].link_type == "CONFIRMED"
+    assert sources[0].evidence_quote == "wants to adopt children"
+
+
+def test_apply_decisions_still_rejects_an_external_target_change(tmp_path) -> None:
+    database_path = tmp_path / "external-target-change.db"
+    backend = SQLiteBackend(
+        database_path,
+        embedding_provider=StaticEmbeddingProvider(),
+    )
+    old_id = backend.insert("User lives in Shanghai.")
+    concurrent_id = backend.supersede(old_id, "User lives in Hangzhou.")
+
+    with pytest.raises(RuntimeError, match="target changed"):
+        backend.apply_decisions(
+            source_event("late-source", "User moved to Beijing."),
+            [
+                (
+                    MemoryDecision(
+                        action="SUPERSEDE",
+                        fact="User lives in Beijing.",
+                        matched_memory_id=old_id,
+                    ),
+                    "moved to Beijing",
+                )
+            ],
+        )
+
+    assert backend.get(concurrent_id).state == "ACTIVE"
+    connection = sqlite3.connect(database_path)
+    source_count = connection.execute(
+        "SELECT COUNT(*) FROM source_events WHERE id = 'late-source'"
+    ).fetchone()[0]
+    connection.close()
+    assert source_count == 0
+
+
 def test_supersede_keeps_the_old_memory_and_embedding(tmp_path) -> None:
     backend = SQLiteBackend(
         tmp_path / "supersede.db",

@@ -50,6 +50,54 @@ python3 scripts/setup_agent_skill.py
 Set `MEMKERNEL_URL` when the server does not use the default
 `http://127.0.0.1:8000`, then restart or reload the agent.
 
+## Minimal LoCoMo benchmark
+
+The runner follows the ingest, retrieve, answer, and judge pipeline used by
+[mem0ai/memory-benchmarks](https://github.com/mem0ai/memory-benchmarks).
+It downloads LoCoMo automatically and writes a unified JSON result.
+
+Run a small smoke test (one conversation, five questions):
+
+```bash
+uv run python -m benchmarks.locomo
+```
+
+By default, the runner combines eight turns from the same session into one
+extraction request. Override this with `--chunk-size`; use `--chunk-size 1`
+to reproduce one-turn-at-a-time ingestion.
+
+Run retrieval only, without the answer and judge calls:
+
+```bash
+uv run python -m benchmarks.locomo --predict-only
+```
+
+Run all ten conversations and all supported questions:
+
+```bash
+uv run python -m benchmarks.locomo --all-conversations --all-questions
+```
+
+The runner uses the project's existing `API_KEY`, `API_BASE`, and
+`EMBEDDING_BASE` environment settings.
+
+## performance 
+
+Due to time limited,we only tested on Conversation 1.You can see full result at ./benchmarks/result.json.
+This is our performance :
+
+```json
+      "questions_with_evidence": 30,
+      "evidence_hit_rate": 0.8333,
+      "mean_evidence_recall": 0.7644
+```
+Hit Rate: If a question's evidence is hit,then it counters.
+hit question / all question
+evidence_recall: Measure how much evidence do we recall.
+If one question has 3 evidence,we only recall 2,then it is 2/3
+
+
+
 
 
 
