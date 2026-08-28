@@ -71,6 +71,64 @@ memory, an LLM performs a second comparison to decide whether the facts are:
 This design preserves memory history while keeping normal recall focused on
 the latest known information.
 
+## Lifecycle and tiered recall
+
+MemKernel keeps logical truth separate from physical retrieval tier:
+
+- `ACTIVE` and `SUPERSEDED` describe whether a fact is current.
+- `HOT`, `WARM`, and `COLD` describe how aggressively it participates in
+  semantic recall.
+
+Recall searches `HOT` memories first and falls back to `WARM` only when the
+requested result count is not met. `COLD` memories retain their text and
+provenance but do not participate in normal semantic recall. Returned memories
+are reinforced, and `WARM` results are promoted back to `HOT`. Ranking uses a
+bounded combination of raw semantic relevance, importance, confirmations,
+access history, and recency; the public score remains the raw cosine
+similarity.
+
+Expiration is a soft delete. An expired memory is hidden from semantic search
+but remains available through administrative, history, and provenance paths.
+Python callers can attach a policy when ingesting a source:
+
+```python
+PostMemory(
+    date="2026-08-26T12:00:00Z",
+    content="The experiment window closes next week.",
+    expires_at="2026-09-03T12:00:00Z",
+    importance=0.8,
+    pinned=False,
+)
+```
+
+Lifecycle maintenance is explicit so research runs stay reproducible. Preview
+the default 30-day/180-day thresholds without changing the database:
+
+```bash
+uv run python scripts/run_memory_maintenance.py --dry-run
+```
+
+Apply demotion and remove vectors for active memories that reach `COLD`:
+
+```bash
+uv run python scripts/run_memory_maintenance.py
+```
+
+Add a high/low watermark to bound the HOT working set:
+
+```bash
+uv run python scripts/run_memory_maintenance.py \
+  --max-hot-memories 2000 \
+  --target-hot-memories 1500
+```
+
+Use `--reference-time` to fix the maintenance clock in experiments, or
+`--keep-cold-embeddings` when comparing storage and recall policies. This
+maintenance never deletes memory text, source events, or provenance.
+
+**The performance test of this is still in process**
+
+
 ## Quick start
 
 ### Requirements
@@ -96,7 +154,7 @@ uv sync
 ```
 
 Create or migrate the database and rebuild embeddings for any existing
-memories:
+searchable memories:
 
 ```bash
 uv run python scripts/initialize_database.py
