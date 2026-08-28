@@ -259,6 +259,28 @@ expected piece of evidence was retrieved.
 retrieved per question. For example, retrieving two of three expected evidence
 items gives that question a recall of `2/3`.
 
+## Changelog
+
+### 2026-08-28 - Tiered memory lifecycle
+
+- Added independent `HOT`, `WARM`, and `COLD` retrieval tiers alongside the
+  logical `ACTIVE` and `SUPERSEDED` memory states.
+- Added `HOT`-first recall with `WARM` fallback. Returned memories are
+  reinforced, and returned or newly confirmed `WARM` memories are promoted to
+  `HOT`.
+- Added lifecycle policy fields for importance, expiration, pinning, and an
+  initial tier, together with access and confirmation statistics used for
+  bounded reranking.
+- Added explicit maintenance with default 30-day and 180-day demotion
+  thresholds, optional high/low watermarks, reproducible reference times, and
+  dry-run support.
+- Added non-destructive `COLD` storage: cold vectors can be removed from normal
+  semantic recall while memory text, history, source events, and provenance are
+  preserved.
+- Extended the API, debug view, and Agent Skill integration to expose and use
+  the new lifecycle metadata. Performance evaluation of the tiered policy is
+  still in progress.
+
 ## TODO
 
 - Run the full LoCoMo evaluation.
