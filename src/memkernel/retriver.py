@@ -9,6 +9,8 @@ from memkernel.backend.backend import MemoryRecord
 class RetrievalResult:
     memory: MemoryRecord
     score: float
+    # Internal effective score used for ordering; API ``score`` stays raw cosine.
+    rank_score: float | None = None
 
 
 @dataclass(frozen=True, slots=True)

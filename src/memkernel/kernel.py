@@ -2,11 +2,19 @@ from __future__ import annotations
 
 import json
 import uuid
+from collections.abc import Sequence
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Protocol
 
-from memkernel.backend.backend import MemoryDecision, MemoryRecord, ScoredMemory
+from memkernel.backend.backend import (
+    MemoryDecision,
+    MemoryPolicy,
+    MemoryRecord,
+    MemoryTier,
+    MemoryUsage,
+    ScoredMemory,
+)
 from memkernel.extractor import ExtractedResult, Extractor
 from memkernel.provenance import (
     MemorySourceRecord,
@@ -25,11 +33,26 @@ class KernelBackend(Protocol):
         self,
         extracted: ExtractedResult,
         source_event: SourceEvent,
+        *,
+        policy: MemoryPolicy | None = None,
     ) -> list[MemoryDecision]: ...
 
     def get(self, memory_id: str) -> MemoryRecord | None: ...
 
+    def get_history(self, memory_id: str) -> list[MemoryRecord] | None: ...
+
+    def get_usage(self, memory_id: str) -> MemoryUsage | None: ...
+
     def search_current(self, content: str, top_k: int = 5) -> list[ScoredMemory]: ...
+
+    def search_current_by_tier(
+        self,
+        content: str,
+        *,
+        top_k: int = 5,
+        tiers: Sequence[MemoryTier],
+        reference_time: datetime | str | None = None,
+    ) -> list[ScoredMemory]: ...
 
     def search_history(self, content: str, top_k: int = 5) -> list[ScoredMemory]: ...
 
@@ -45,6 +68,10 @@ class PostMemory:
     source_type: SourceType = "message"
     role: SourceRole | None = "user"
     metadata: dict[str, Any] = field(default_factory=dict)
+    expires_at: str | None = None
+    importance: float = 0.5
+    pinned: bool = False
+    tier: MemoryTier = "HOT"
 
 
 class MemKernel:
@@ -96,9 +123,22 @@ class MemKernel:
             metadata=sanitized_metadata,
         )
         extracted = self.extractor.extract_with_source(source_event)
+        policy = MemoryPolicy(
+            tier=raw.tier,
+            importance=raw.importance,
+            expires_at=self._normalize_optional_timestamp(
+                raw.expires_at,
+                field_name="expires_at",
+            ),
+            pinned=raw.pinned,
+        )
+        # no policy
+        if policy == MemoryPolicy():
+            policy = None
         return self.memory_backend.remember(
             extracted,
             source_event=source_event,
+            policy=policy,
         )
 
     @staticmethod
@@ -109,6 +149,24 @@ class MemKernel:
             parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
         except ValueError as error:
             raise ValueError("date must be a valid ISO-8601 timestamp") from error
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=timezone.utc)
+        return parsed.astimezone(timezone.utc).isoformat()
+
+    @staticmethod
+    def _normalize_optional_timestamp(
+        value: str | None,
+        *,
+        field_name: str,
+    ) -> str | None:
+        if value is None:
+            return None
+        try:
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except (AttributeError, ValueError) as error:
+            raise ValueError(
+                f"{field_name} must be a valid ISO-8601 timestamp"
+            ) from error
         if parsed.tzinfo is None:
             parsed = parsed.replace(tzinfo=timezone.utc)
         return parsed.astimezone(timezone.utc).isoformat()
@@ -130,29 +188,7 @@ class MemKernel:
 
     def get_history(self, memory_id: str) -> list[MemoryRecord] | None:
         """Return a memory's supersession chain from oldest to newest."""
-        memories = self.memory_backend.list_memories()
-        by_id = {memory.id: memory for memory in memories}
-        if memory_id not in by_id:
-            return None
-
-        predecessor_by_id = {
-            memory.superseded_by_id: memory.id
-            for memory in memories
-            if memory.superseded_by_id in by_id
-        }
-
-        oldest_id = memory_id
-        while oldest_id in predecessor_by_id:
-            oldest_id = predecessor_by_id[oldest_id]
-
-        history: list[MemoryRecord] = []
-        current_id: str | None = oldest_id
-        while current_id in by_id:
-            memory = by_id[current_id]
-            history.append(memory)
-            current_id = memory.superseded_by_id
-
-        return history
+        return self.memory_backend.get_history(memory_id)
 
     def list_memories(self) -> list[MemoryRecord]:
         """Return all memories for administrative and debugging views."""
@@ -162,3 +198,6 @@ class MemKernel:
         if self.memory_backend.get(memory_id) is None:
             return None
         return self.memory_backend.get_sources(memory_id)
+
+    def get_usage(self, memory_id: str) -> MemoryUsage | None:
+        return self.memory_backend.get_usage(memory_id)

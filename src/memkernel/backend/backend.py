@@ -1,4 +1,6 @@
+from collections.abc import Sequence
 from dataclasses import dataclass
+from datetime import datetime
 from typing import Any, Dict, Literal, Protocol
 
 from memkernel.extractor import ExtractedResult
@@ -101,6 +103,10 @@ class Backend(Protocol):
 
     def get(self, memory_id: str) -> MemoryRecord | None: ...
 
+    def get_history(self, memory_id: str) -> list[MemoryRecord] | None: ...
+
+    def get_usage(self, memory_id: str) -> MemoryUsage | None: ...
+
     def remove(self, memory_id: str) -> bool: ...
 
     def query_by(self, query_dict: Dict[str, Any]) -> MemoryRecord | None: ...
@@ -108,6 +114,15 @@ class Backend(Protocol):
     def search_similar(self, content: str, top_k: int = 5) -> list[ScoredMemory]: ...
 
     def search_current(self, content: str, top_k: int = 5) -> list[ScoredMemory]: ...
+
+    def search_current_by_tier(
+        self,
+        content: str,
+        *,
+        top_k: int = 5,
+        tiers: Sequence[MemoryTier],
+        reference_time: datetime | str | None = None,
+    ) -> list[ScoredMemory]: ...
 
     def search_history(self, content: str, top_k: int = 5) -> list[ScoredMemory]: ...
 
