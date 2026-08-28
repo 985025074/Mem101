@@ -8,8 +8,11 @@ from typing import cast
 from memkernel.ai import AIProvider, DeepSeekAI
 from memkernel.backend.backend import (
     MemoryDecision,
+    MemoryPolicy,
     MemoryRecord,
     MemoryRelation,
+    MemoryTier,
+    MemoryUsage,
     ScoredMemory,
 )
 from memkernel.backend.sqlite_adapter import SQLiteBackend
@@ -321,6 +324,8 @@ class BackendV2:
         self,
         extracted: ExtractedResult,
         source_event: SourceEvent,
+        *,
+        policy: MemoryPolicy | None = None,
     ) -> list[MemoryDecision]:
         """Remeber a extracted fact,with source info recorded"""
         # safety check
@@ -384,6 +389,7 @@ class BackendV2:
         decisions = self.sqlite_backend.apply_decisions(
             source_event,
             pending_changes,
+            policy=policy,
         )
 
         for completed_decision in decisions:
@@ -404,6 +410,9 @@ class BackendV2:
     def get(self, memory_id: str) -> MemoryRecord | None:
         return self.sqlite_backend.get(memory_id)
 
+    def get_history(self, memory_id: str) -> list[MemoryRecord] | None:
+        return self.sqlite_backend.get_history(memory_id)
+
     def remove(self, memory_id: str) -> bool:
         return self.sqlite_backend.remove(memory_id)
 
@@ -413,8 +422,37 @@ class BackendV2:
     def search_current(self, content: str, top_k: int = 5) -> list[ScoredMemory]:
         return self.sqlite_backend.search_current(content, top_k=top_k)
 
+    def search_current_by_tier(
+        self,
+        content: str,
+        *,
+        top_k: int = 5,
+        tiers: Sequence[MemoryTier],
+        reference_time=None,
+    ) -> list[ScoredMemory]:
+        return self.sqlite_backend.search_current_by_tier(
+            content,
+            top_k=top_k,
+            tiers=tiers,
+            reference_time=reference_time,
+        )
+
     def search_history(self, content: str, top_k: int = 5) -> list[ScoredMemory]:
         return self.sqlite_backend.search_history(content, top_k=top_k)
+
+    def record_access(
+        self,
+        memory_ids: Sequence[str],
+        *,
+        promote: bool = True,
+    ) -> int:
+        return self.sqlite_backend.record_access(memory_ids, promote=promote)
+
+    def get_usage(self, memory_id: str) -> MemoryUsage | None:
+        return self.sqlite_backend.get_usage(memory_id)
+
+    def run_maintenance(self, **kwargs) -> dict[str, int]:
+        return self.sqlite_backend.run_maintenance(**kwargs)
 
     def list_memories(self) -> list[MemoryRecord]:
         return self.sqlite_backend.list_memories()
