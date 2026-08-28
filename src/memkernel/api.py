@@ -3,6 +3,7 @@ from __future__ import annotations
 import html
 import json
 import logging
+from datetime import datetime
 from typing import Annotated, Any
 
 from fastapi import Depends, FastAPI, HTTPException, Request
@@ -14,6 +15,7 @@ from memkernel.backend.backend import (
     MemoryDecision,
     MemoryRecord,
     MemoryState,
+    MemoryTier,
 )
 from memkernel.backend.backend_v2 import BackendV2
 from memkernel.embedding import OpenAIEmbeddingProvider
@@ -54,6 +56,10 @@ class RememberRequest(BaseModel):
     role: SourceRole | None = "user"
     observed_at: str | None = None
     metadata: dict[str, Any] = Field(default_factory=dict)
+    tier: MemoryTier = "HOT"
+    importance: float = Field(default=0.5, ge=0.0, le=1.0, strict=True)
+    expires_at: str | None = None
+    pinned: bool = Field(default=False, strict=True)
 
     @field_validator("content")
     @classmethod
@@ -62,6 +68,19 @@ class RememberRequest(BaseModel):
         if not content:
             raise ValueError("content must be a non-empty string")
         return content
+
+    @field_validator("expires_at")
+    @classmethod
+    def validate_expires_at(cls, value: str | None) -> str | None:
+        if value is None:
+            return None
+        try:
+            datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ValueError(
+                "expires_at must be a valid ISO-8601 timestamp"
+            ) from error
+        return value
 
 
 class MemoryDecisionResponse(BaseModel):
@@ -190,8 +209,7 @@ def _debug_table(memory_kernel: MemKernel) -> str:
 
     for memory in memories:
         linked_sources = memory_kernel.get_sources(memory.id) or []
-        usage_getter = getattr(memory_kernel, "get_usage", None)
-        usage = usage_getter(memory.id) if callable(usage_getter) else None
+        usage = memory_kernel.get_usage(memory.id)
         source_rows: list[MemorySourceRecord | None] = (
             list(linked_sources) if linked_sources else [None]
         )
@@ -357,10 +375,15 @@ def create_app(
     ) -> RememberResponse:
         logger.debug(
             "POST /v1/memories source_type=%s role=%s observed_at=%s "
+            "tier=%s importance=%s expires_at=%s pinned=%s "
             "content_length=%d metadata_keys=%s",
             request.source_type,
             request.role,
             request.observed_at,
+            request.tier,
+            request.importance,
+            request.expires_at,
+            request.pinned,
             len(request.content),
             sorted(request.metadata),
         )
@@ -372,6 +395,10 @@ def create_app(
                     source_type=request.source_type,
                     role=request.role,
                     metadata=request.metadata,
+                    tier=request.tier,
+                    importance=request.importance,
+                    expires_at=request.expires_at,
+                    pinned=request.pinned,
                 )
             )
         except ExtractionValidationError as error:
