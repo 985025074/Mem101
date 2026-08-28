@@ -51,6 +51,33 @@ validated failure modes.
 Do not store secrets, guesses, temporary status, raw logs, routine tool output,
 or an entire conversation. A recall does not by itself authorize a write.
 
+### Set lifecycle policy only when justified
+
+Omit policy flags for ordinary memories so the service uses its defaults:
+`HOT`, importance `0.5`, no expiration, and not pinned. Supply policy only when
+the user or a verified project rule provides a reason:
+
+- `--importance 0..1` expresses operational importance, not confidence that the
+  memory is true. Do not invent a value from wording alone.
+- `--expires-at ISO-8601` is for information with a known validity deadline.
+- `--pinned` is for an explicit must-retain constraint. It prevents ordinary age
+  and capacity demotion, but an explicit expiration still takes precedence.
+- `--tier WARM` lowers initial retrieval priority. `--tier COLD` is archival and
+  excluded from ordinary semantic recall; use either only when explicitly
+  required. Omit `--tier` for the normal `HOT` behavior.
+
+For example:
+
+```bash
+python3 skills/memkernel-memory/scripts/memkernel_client.py \
+  remember "The production database must remain PostgreSQL." --role user \
+  --importance 0.9 --pinned
+
+python3 skills/memkernel-memory/scripts/memkernel_client.py \
+  remember "The migration freeze lasts through September 30." --role user \
+  --expires-at "2026-10-01T00:00:00Z"
+```
+
 MemKernel extracts evidence-bound facts from source events. Submit one source
 event at a time and preserve its original content rather than pre-extracting or
 paraphrasing it. Choose the source fields as follows:

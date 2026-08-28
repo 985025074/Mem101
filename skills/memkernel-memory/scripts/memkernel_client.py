@@ -40,6 +40,16 @@ def positive_float(value: str) -> float:
     return parsed
 
 
+def unit_float(value: str) -> float:
+    try:
+        parsed = float(value)
+    except ValueError as error:
+        raise argparse.ArgumentTypeError("must be a number") from error
+    if not 0.0 <= parsed <= 1.0:
+        raise argparse.ArgumentTypeError("must be between zero and one")
+    return parsed
+
+
 class MemKernelClient:
     def __init__(self, base_url: str, timeout: float):
         normalized_url = base_url.strip().rstrip("/")
@@ -147,6 +157,25 @@ def build_parser() -> argparse.ArgumentParser:
     )
     remember.add_argument("--observed-at", help="ISO-8601 source timestamp")
     remember.add_argument("--metadata", type=json_object)
+    remember.add_argument(
+        "--tier",
+        choices=("HOT", "WARM", "COLD"),
+        help="initial memory tier (default: HOT)",
+    )
+    remember.add_argument(
+        "--importance",
+        type=unit_float,
+        help="memory importance from 0 to 1 (default: 0.5)",
+    )
+    remember.add_argument(
+        "--expires-at",
+        help="ISO-8601 timestamp after which the memory expires",
+    )
+    remember.add_argument(
+        "--pinned",
+        action="store_true",
+        help="protect the memory from ordinary age and capacity demotion",
+    )
 
     history = commands.add_parser(
         "history",
@@ -189,6 +218,14 @@ def execute(client: MemKernelClient, args: argparse.Namespace) -> Any:
         }
         if args.observed_at is not None:
             payload["observed_at"] = args.observed_at
+        if args.tier is not None:
+            payload["tier"] = args.tier
+        if args.importance is not None:
+            payload["importance"] = args.importance
+        if args.expires_at is not None:
+            payload["expires_at"] = args.expires_at
+        if args.pinned:
+            payload["pinned"] = True
         return client.request("POST", "/v1/memories", payload)
 
     if args.command == "history":
