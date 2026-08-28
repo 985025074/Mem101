@@ -190,6 +190,8 @@ def _debug_table(memory_kernel: MemKernel) -> str:
 
     for memory in memories:
         linked_sources = memory_kernel.get_sources(memory.id) or []
+        usage_getter = getattr(memory_kernel, "get_usage", None)
+        usage = usage_getter(memory.id) if callable(usage_getter) else None
         source_rows: list[MemorySourceRecord | None] = (
             list(linked_sources) if linked_sources else [None]
         )
@@ -218,6 +220,11 @@ def _debug_table(memory_kernel: MemKernel) -> str:
                 <tr>
                   <td><code>{_html_cell(memory.id)}</code></td>
                   <td><span class="state {memory.state.lower()}">{_html_cell(memory.state)}</span></td>
+                  <td>{_html_cell(usage.tier if usage else None)}</td>
+                  <td>{_html_cell(usage.importance if usage else None)}</td>
+                  <td>{_html_cell(usage.access_count if usage else None)}</td>
+                  <td>{_html_cell(usage.confirmation_count if usage else None)}</td>
+                  <td>{_html_cell(memory.expires_at)}</td>
                   <td class="text">{_html_cell(memory.content)}</td>
                   <td>{_html_cell(memory.created_at)}</td>
                   <td><code>{_html_cell(memory.superseded_by_id)}</code></td>
@@ -235,7 +242,7 @@ def _debug_table(memory_kernel: MemKernel) -> str:
 
     if not rows:
         rows.append(
-            '<tr><td colspan="13" class="no-data">No memories stored.</td></tr>'
+            '<tr><td colspan="18" class="no-data">No memories stored.</td></tr>'
         )
 
     return f"""<!doctype html>
@@ -280,7 +287,9 @@ def _debug_table(memory_kernel: MemKernel) -> str:
     <table>
       <thead>
         <tr>
-          <th>Memory ID</th><th>State</th><th>Memory</th><th>Created</th>
+          <th>Memory ID</th><th>State</th><th>Tier</th><th>Importance</th>
+          <th>Accesses</th><th>Confirmations</th><th>Expires</th>
+          <th>Memory</th><th>Created</th>
           <th>Superseded by</th><th>Superseded at</th><th>Source type</th>
           <th>Role</th><th>Observed</th><th>Link</th><th>Evidence</th>
           <th>Source content</th><th>Metadata</th>
@@ -414,14 +423,16 @@ def create_app(
     return application
 
 
-kernel = MemKernel(
-    extractor=LLMExtractorV2(),
-    memory_backend=BackendV2(
-        embedding_provider=OpenAIEmbeddingProvider(OpenAIEmbeddingProvider.get_client())
+app = create_app(
+    kernel=MemKernel(
+        extractor=LLMExtractorV2(),
+        memory_backend=BackendV2(
+            embedding_provider=OpenAIEmbeddingProvider(
+                OpenAIEmbeddingProvider.get_client()
+            )
+        ),
     ),
 )
-
-app = create_app(kernel=kernel)
 
 
 __all__ = [
